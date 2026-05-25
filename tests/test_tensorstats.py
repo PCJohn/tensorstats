@@ -472,18 +472,29 @@ class TestLatency:
     @pytest.mark.parametrize("shape", SHAPES)
     def test_global_float64_faster_than_numpy(self, shape):
         """
-        tensorstats beats numpy for float64 at small and large shapes.
-        At 64x64 and 128x128 the result is platform/OS-dependent (L1/L2 cache
-        boundary); we only assert at sizes where we reliably win on all platforms.
+        tensorstats beats numpy for f64 at small (<=32x32) and large (>=256x256) sizes.
+
+        Why we win:
+          Small: ts avoids numpy's multiple temporary array allocations (d, d*d, etc.)
+          Large: numpy's 3 temporary allocations of 786KB+ each hurt; ts uses one pass.
+
+        Why 64x64 and 128x128 are skipped:
+          At these sizes (48KB–393KB) the data is at the L1/L2 cache boundary.
+          numpy's AVX2-vectorized single-purpose reductions (.mean(), element-wise ops)
+          are competitive with our single-pass approach. The result is platform-dependent
+          (MSVC vs GCC codegen, cache hierarchy). We don't assert here to avoid flakiness.
+          Our real advantages at those sizes are uint8 histogram and multi-reduction.
         """
         arr=np.random.default_rng(0).integers(0,255,shape,dtype=np.uint8).astype(np.float64)
         ts_ms=timeit_ms(lambda: ts.compute(arr,axes=None))
         np_ms=timeit_ms(lambda: self._numpy_global(arr))
         print(f"\n  shape={shape} f64  ts={ts_ms:.4f}ms  np={np_ms:.4f}ms  ratio={ts_ms/np_ms:.2f}x")
         h, w, _ = shape
-        # Assert only at small sizes (call-overhead dominated) and large (SIMD win)
-        if h * w <= 32 * 32 or h * w >= 256 * 256:
-            assert ts_ms < np_ms, f"ts={ts_ms:.4f} np={np_ms:.4f} shape={shape}"
+        if h * w <= 32 * 32:
+            assert ts_ms < np_ms, f"ts={ts_ms:.4f} np={np_ms:.4f} shape={shape} — small array, call-overhead win expected"
+        elif h * w >= 256 * 256:
+            assert ts_ms < np_ms, f"ts={ts_ms:.4f} np={np_ms:.4f} shape={shape} — large array, alloc-overhead win expected"
+        # 64x64 and 128x128: print only, no assert (cache boundary, platform-dependent)
 
     @pytest.mark.parametrize("shape", SHAPES)
     def test_global_uint8_faster_than_numpy(self, shape):

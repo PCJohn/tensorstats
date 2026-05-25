@@ -153,8 +153,14 @@ static void global_pass(const T* TS_RESTRICT data, int64_t n, int64_t step,
 {
     int64_t ns=(n+step-1)/step;
     double s=0;
+#if defined(_MSC_VER)
+    #pragma loop(ivdep)
+#endif
     for(int64_t i=0;i<n;i+=step) s+=(double)data[i];
     mu=s/(double)ns; m2=m3=m4=0;
+#if defined(_MSC_VER)
+    #pragma loop(ivdep)
+#endif
     for(int64_t i=0;i<n;i+=step){ double d=(double)data[i]-mu,d2=d*d; m2+=d2;m3+=d2*d;m4+=d2*d2; }
     double inv=1.0/(double)ns; m2*=inv; m3*=inv; m4*=inv;
 }
@@ -180,8 +186,14 @@ static void last_axis_pass(const T* TS_RESTRICT data,
     int64_t nrows=(HW+sr-1)/sr; double inv=1.0/(double)nrows;
     for(int64_t c=0;c<C;c+=sc){
         double s=0;
+#if defined(_MSC_VER)
+        #pragma loop(ivdep)
+#endif
         for(int64_t r=0;r<HW;r+=sr) s+=(double)data[r*C+c];
         mu[c]=s*inv; double s2=0,s3=0,s4=0;
+#if defined(_MSC_VER)
+        #pragma loop(ivdep)
+#endif
         for(int64_t r=0;r<HW;r+=sr){ double d=(double)data[r*C+c]-mu[c],d2=d*d; s2+=d2;s3+=d2*d;s4+=d2*d2; }
         m2[c]=s2*inv; m3[c]=s3*inv; m4[c]=s4*inv;
     }
