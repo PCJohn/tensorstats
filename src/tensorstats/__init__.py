@@ -1,36 +1,34 @@
 """
 tensorstats — fast two-pass central moment computation.
 
-Moments layout in output arrays (axis 0):
-    [0]  mean                  (1st raw moment)
-    [1]  2nd central moment    (variance, not divided by σ)
-    [2]  3rd central moment
-    [3]  4th central moment
+Output convention: moments-LAST.
+All output arrays have shape (*reduction_output_shape, n_moments):
+  "global"  → (n_moments,)
+  "0,1"     → (C, n_moments)
+  "grid"    → (*cell_shape, n_moments)
 
-Standardised moments (skewness, kurtosis):
-    std      = sqrt(m[1])
-    skewness = m[2] / std**3
-    kurtosis = m[3] / m[1]**2
+Moments layout (last axis):
+  [..., 0]  mean
+  [..., 1]  2nd central moment (variance)
+  [..., 2]  3rd central moment
+  [..., 3]  4th central moment
 
-Performance notes:
-    • float32 input: 2× faster than float64 (AVX2 fits 8 floats vs 4 doubles)
-    • stride=(2,...): halves elements → roughly halves compute time
-    • For natural images stride ≤ 2 keeps mean/std error < 1%;
-      higher moments degrade faster — stride ≤ 2 recommended for accuracy
-    • The resize/interpolation scheme used before calling tensorstats
-      meaningfully affects which features survive — see README
+Derived standardised moments:
+  std      = sqrt(m[..., 1])
+  skewness = m[..., 2] / std**3
+  kurtosis = m[..., 3] / m[..., 1]**2
 """
 
 from __future__ import annotations
 import numpy as np
-from typing import Optional, Sequence, Union
+from typing import Optional, Union
 
 from .tensorstats_core import compute_f64, compute_f32, compute_u8
 
-_AxisSpec = Optional[Union[int, Sequence[int]]]
+_AxisSpec = Optional[Union[int, tuple, list]]
 
 
-def _normalise_one(spec: _AxisSpec, ndim: int) -> list[int]:
+def _normalise_one(spec, ndim: int) -> list[int]:
     if spec is None:
         return []
     if isinstance(spec, (int, np.integer)):
@@ -54,57 +52,82 @@ def _parse_axes(axes, ndim: int) -> list[list[int]]:
     if isinstance(axes, list):
         if len(axes) == 0:
             return [[]]
-        first = axes[0]
-        if isinstance(first, (int, np.integer)):
+        if isinstance(axes[0], (int, np.integer)):
             return [_normalise_one(axes, ndim)]
         return [_normalise_one(s, ndim) for s in axes]
     raise TypeError(f"unsupported axes type: {type(axes)}")
 
 
+def _parse_grid(grid, ndim: int) -> list[int]:
+    """
+    Normalise the grid parameter to a list of ints of length ndim.
+    grid[d] = number of power-of-2 subdivisions along axis d.
+      0  → 1 cell (no subdivision)
+      1  → 2 cells
+      2  → 4 cells
+      k  → 2^k cells
+    Returns empty list if grid is None (no grid requested).
+    """
+    if grid is None:
+        return []
+    if isinstance(grid, int):
+        return [grid] * ndim
+    g = list(grid)
+    if len(g) != ndim:
+        raise ValueError(f"grid length {len(g)} must match arr.ndim={ndim}")
+    if any(v < 0 for v in g):
+        raise ValueError("grid values must be >= 0")
+    return g
+
+
 def compute(
     arr: np.ndarray,
     axes=None,
-    stride: Optional[Union[int, tuple[int, ...]]] = None,
+    stride=None,
     n_moments: int = 4,
+    grid=None,
 ) -> dict[str, np.ndarray]:
     """
-    Compute the first ``n_moments`` central moments of ``arr`` along each
-    requested axis-set in two passes over the data.
+    Compute the first n_moments central moments of arr.
 
     Parameters
     ----------
     arr :
-        Input array. Accepts uint8, float32, float64 natively (no copy made
-        for float32/float64 C-contiguous arrays). Other dtypes are cast to
-        float64. cv2 images (uint8 BGR) are accepted directly.
+        Input array. uint8, float32, float64 accepted natively.
+        Other dtypes cast to float64.
     axes :
-        One axis-spec or a list of axis-specs:
-          ``None``           → global (all axes)
-          ``int``            → reduce over that axis
-          ``(int, ...)``     → reduce over those axes jointly
-          ``[spec, ...]``    → compute multiple reductions
-        Example: ``axes=[None, (0,1), 2]``
+        Axis-sets to reduce over (one or a list):
+          None           → global (all axes)
+          int            → single axis
+          (int, ...)     → joint reduction
+          [spec, ...]    → multiple reductions in one call
     stride :
-        Subsample the array without resize/malloc. Skips elements along
-        each axis. Halving stride roughly halves compute time.
-          ``None`` or ``1``  → use all elements (default)
-          ``2``              → every other element on all axes
-          ``(2, 2, 1)``      → stride 2 on axes 0,1; all elements on axis 2
-        For natural images, stride ≤ 2 gives < 1% error on mean/std.
-        Higher moments (skewness, kurtosis) degrade faster with stride.
+        Subsample without malloc/resize.
+          None or 1      → all elements
+          int            → uniform flat step
+          (int, ...)     → per-axis step
     n_moments :
-        Number of moments to compute (1–4, default 4).
+        Number of moments (1–4, default 4).
+    grid :
+        Power-of-2 grid subdivision per axis.
+          None           → no grid
+          int k          → 2^k cells on every axis
+          (k0, k1, ...)  → 2^k0 cells on axis 0, 2^k1 on axis 1, etc.
+        Result stored in result["grid"] with shape (*cell_shape, n_moments).
+        uint8 histogram path used for cells >= 256 pixels;
+        direct loop used for smaller cells.
 
     Returns
     -------
-    dict  key → ndarray of shape ``(n_moments, *output_shape)``
-        ``"global"``  — all-axes reduction
-        ``"0,1"``     — axes=(0,1) reduction
-        ``"2"``       — axis=2 reduction
+    dict[str, np.ndarray]  — moments-LAST convention
+        "global"  → (n_moments,)
+        "0,1"     → (C, n_moments)
+        "0"       → (W, C, n_moments)
+        "grid"    → (*cell_shape, n_moments)
     """
     ndim = arr.ndim
 
-    # Normalise stride → list[int] of length ndim
+    # Stride
     if stride is None or stride == 1:
         stride_vec = [1] * ndim
     elif isinstance(stride, int):
@@ -112,18 +135,17 @@ def compute(
     else:
         stride_vec = list(stride)
         if len(stride_vec) != ndim:
-            raise ValueError(f"stride length {len(stride_vec)} must match arr.ndim={ndim}")
+            raise ValueError(f"stride length must match arr.ndim={ndim}")
 
     axes_list = _parse_axes(axes, ndim)
+    grid_vec  = _parse_grid(grid, ndim)
 
-    # Dispatch on dtype — uint8 and float32 accepted natively (2× faster for f32)
     if arr.dtype == np.uint8 and arr.flags['C_CONTIGUOUS']:
-        return compute_u8(arr, axes_list, stride_vec, n_moments)
+        return compute_u8(arr, axes_list, stride_vec, n_moments, grid_vec)
     if arr.dtype == np.float32 and arr.flags['C_CONTIGUOUS']:
-        return compute_f32(arr, axes_list, stride_vec, n_moments)
-    # Everything else → float64
+        return compute_f32(arr, axes_list, stride_vec, n_moments, grid_vec)
     arr64 = np.ascontiguousarray(arr, dtype=np.float64)
-    return compute_f64(arr64, axes_list, stride_vec, n_moments)
+    return compute_f64(arr64, axes_list, stride_vec, n_moments, grid_vec)
 
 
 __all__ = ["compute"]
