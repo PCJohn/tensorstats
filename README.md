@@ -22,41 +22,99 @@ Typical speedups vs NumPy (global moments, float64):
 | 128×128×3 | ~1.6× |
 | 256×256×3 | ~2× |
 
-## Install
+## Build and install
+
+`tensorstats` is a C++ extension. Building it requires a C++17 compiler,
+CMake, and Python headers. The build is driven by `pip install -e .` which
+invokes CMake automatically via `scikit-build-core`.
+
+---
+
+### Linux (Ubuntu / Debian)
 
 ```bash
-pip install -e .
-```
-
-### Prerequisites by platform
-
-**Linux**
-```bash
-# Ubuntu/Debian
+# 1. Install system dependencies
 sudo apt install build-essential cmake python3-dev
+
+# 2. Install Python build tools
 pip install scikit-build-core nanobind
+
+# 3. Clone and build (CMake runs automatically)
+git clone https://github.com/PCJohn/tensorstats
+cd tensorstats
 pip install -e .
+
+# 4. Verify
+python -c "import tensorstats; print('ok')"
 ```
 
-**macOS**
+---
+
+### macOS
+
 ```bash
-# Xcode command-line tools
+# 1. Install Xcode command-line tools (includes clang + make)
 xcode-select --install
+
+# 2. Install CMake
 brew install cmake
+
+# 3. Install Python build tools
 pip install scikit-build-core nanobind
+
+# 4. Clone and build
+git clone https://github.com/PCJohn/tensorstats
+cd tensorstats
 pip install -e .
+
+# 5. Verify
+python -c "import tensorstats; print('ok')"
 ```
 
-**Windows**
+---
 
-1. Install [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
-   — select **"Desktop development with C++"** workload
-2. Install [CMake](https://cmake.org/download/) — add to PATH during install
-3. Open **"Developer Command Prompt for VS 2022"** (not a regular terminal)
-4. Run:
+### Windows
+
+Windows requires the MSVC compiler from Visual Studio Build Tools. You must
+build from the **Developer Command Prompt** so that CMake can locate the
+compiler — a regular PowerShell or CMD window will fail with "compiler not
+found".
+
+**Step 1 — Install Visual Studio Build Tools 2022**
+
+Download from: https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022
+
+During install, select the **"Desktop development with C++"** workload.
+This installs MSVC, the Windows SDK, and CMake integration.
+
+**Step 2 — Install CMake**
+
+Download from: https://cmake.org/download/ — check "Add CMake to system PATH" during install.
+
+**Step 3 — Open the Developer Command Prompt**
+
+Start menu → search **"Developer Command Prompt for VS 2022"** → open it.
+Do not use PowerShell or a regular CMD window.
+
+**Step 4 — Build**
+
 ```bat
 pip install scikit-build-core nanobind
+
+git clone https://github.com/PCJohn/tensorstats
+cd tensorstats
 pip install -e .
+```
+
+`pip install -e .` is the build step. It calls CMake under the hood to
+compile `src/tensorstats/core.cpp` with MSVC and link the Python extension.
+You will see CMake output scroll by — this is expected and takes 30–60s on
+first build.
+
+**Step 5 — Verify**
+
+```bat
+python -c "import tensorstats; print('ok')"
 ```
 
 > **Note**: must use the VS Developer Command Prompt so CMake finds the MSVC compiler.

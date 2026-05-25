@@ -12,6 +12,14 @@
 #include <string>
 #include <cstdint>
 
+
+// Portable no-alias hint: __restrict__ on GCC/Clang, __restrict on MSVC
+#if defined(_MSC_VER)
+#  define TS_RESTRICT __restrict
+#else
+#  define TS_RESTRICT __restrict__
+#endif
+
 namespace nb = nanobind;
 
 // ---------------------------------------------------------------------------
@@ -43,7 +51,7 @@ namespace nb = nanobind;
 //   • uint8 general (arbitrary axes): direct loop (histogram doesn't simplify).
 //   • stride=2 on global path: ~2× faster (half elements, same loop structure)
 //   • Strided last-axis path: column loops with sr/sc strides, still vectorized
-//   • __restrict__ on all data pointers: no-alias hint for the compiler
+//   • TS_RESTRICT on all data pointers: no-alias hint for the compiler
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -52,8 +60,8 @@ namespace nb = nanobind;
 
 // Build a 256-bin histogram using 4-way parallel counters to reduce
 // write-after-write stalls on the same bin (improves out-of-order scheduling).
-static void build_hist4(const uint8_t* __restrict__ d, int64_t n,
-                         int64_t* __restrict__ hist)
+static void build_hist4(const uint8_t* TS_RESTRICT d, int64_t n,
+                         int64_t* TS_RESTRICT hist)
 {
     int64_t h0[256]={}, h1[256]={}, h2[256]={}, h3[256]={};
     int64_t i=0, n4=(n>>2)<<2;
@@ -70,7 +78,7 @@ static void build_hist4(const uint8_t* __restrict__ d, int64_t n,
 // Two-pass central moments from a 256-bin histogram.
 // Pass 1 (mean): exact integer sum Σ hist[v]*v — no float rounding.
 // Pass 2 (moments): only 256 float iterations regardless of N.
-static void moments_from_hist(const int64_t* __restrict__ hist, int64_t n,
+static void moments_from_hist(const int64_t* TS_RESTRICT hist, int64_t n,
                                double &mu, double &m2, double &m3, double &m4)
 {
     int64_t s1 = 0;
@@ -86,7 +94,7 @@ static void moments_from_hist(const int64_t* __restrict__ hist, int64_t n,
 }
 
 // Global uint8: histogram + moments. stride > 1 samples every stride-th element.
-static void global_u8_hist(const uint8_t* __restrict__ d, int64_t n,
+static void global_u8_hist(const uint8_t* TS_RESTRICT d, int64_t n,
                             int64_t step,
                             double &mu, double &m2, double &m3, double &m4)
 {
@@ -105,7 +113,7 @@ static void global_u8_hist(const uint8_t* __restrict__ d, int64_t n,
 
 // Per-channel uint8: one histogram per channel, strided column access.
 // Layout: data[r*C + c], r in [0, HW), c in [0, C).
-static void last_axis_u8_hist(const uint8_t* __restrict__ d,
+static void last_axis_u8_hist(const uint8_t* TS_RESTRICT d,
                                int64_t HW, int64_t C,
                                int64_t sr, int64_t sc,
                                std::vector<double> &mu,
@@ -155,7 +163,7 @@ static std::vector<int64_t> sampled_indices(
 // Global two-pass: straight loop with flat step (= uniform stride)
 // ---------------------------------------------------------------------------
 template<typename T>
-static void global_pass(const T* __restrict__ data,
+static void global_pass(const T* TS_RESTRICT data,
                          int64_t n, int64_t step,
                          double &out_mu,
                          double &out_m2, double &out_m3, double &out_m4)
@@ -175,7 +183,7 @@ static void global_pass(const T* __restrict__ data,
 
 // Global two-pass via precomputed sampled index list (non-uniform strides)
 template<typename T>
-static void global_pass_idx(const T* __restrict__ data,
+static void global_pass_idx(const T* TS_RESTRICT data,
                               const std::vector<int64_t> &idx,
                               double &out_mu,
                               double &out_m2, double &out_m3, double &out_m4)
@@ -200,7 +208,7 @@ static void global_pass_idx(const T* __restrict__ data,
 // sc: stride over the C dimension (which channels to sample)
 // ---------------------------------------------------------------------------
 template<typename T>
-static void last_axis_pass(const T* __restrict__ data,
+static void last_axis_pass(const T* TS_RESTRICT data,
                             int64_t HW, int64_t C,
                             int64_t sr, int64_t sc,
                             std::vector<double> &mu,
@@ -228,7 +236,7 @@ static void last_axis_pass(const T* __restrict__ data,
 // General two-pass: arbitrary axes via precomputed (flat_idx, bucket) pairs
 // ---------------------------------------------------------------------------
 template<typename T>
-static void general_pass(const T* __restrict__ data,
+static void general_pass(const T* TS_RESTRICT data,
                           const std::vector<std::pair<int64_t,int64_t>> &pairs,
                           int64_t n_buckets,
                           std::vector<double> &mu,
