@@ -1,274 +1,127 @@
 # tensorstats
 
-Fast central moment computation for tensors and arrays, implemented in C++
-with a Python/NumPy interface via [nanobind](https://github.com/wjakob/nanobind).
+Fast central moment computation for NumPy arrays. Computes mean, variance, skewness, and kurtosis in a single library call — substantially faster than NumPy for repeated computation on fixed shapes.
 
-Designed as a high-speed gate before expensive vision pipelines — blank frame
-detection, scene change detection, image statistics for classifier routing.
-
----
-
-## Algorithms
-
-### General case (float32, float64)
-
-Two numerically stable passes over the data. No temporary arrays allocated.
-
-**Pass 1 — mean:**
-```
-mu = Σ x_i / n
-```
-
-**Pass 2 — central moments:**
-```
-for each x_i:
-    d  = x_i - mu
-    d2 = d * d
-    m2 += d2          # variance accumulator
-    m3 += d2 * d
-    m4 += d2 * d2
-```
-
-This avoids the catastrophic cancellation of the raw-moment approach
-(`Σx²/n − μ²`), which loses precision for near-constant arrays.
-
-### uint8 special case — histogram path
-
-uint8 pixels take values in [0, 255]. Instead of iterating over N pixels
-for the moment accumulation, tensorstats builds a 256-bin histogram in one
-pass and computes moments from the histogram in a fixed 256 iterations.
-
-```
-Pass 1: hist[v]++ for each pixel v           # N integer increments
-Pass 2: mu = Σ hist[v]*v / n                 # exact integer mean
-Pass 3: m2,m3,m4 = Σ hist[v]*(v-mu)^k       # only 256 float FMAs
-```
-
-The histogram build uses 4-way parallel counters (h0/h1/h2/h3 merged at
-the end) to reduce write-after-write stalls on hot bins. The mean is
-computed from an exact integer sum — no floating-point rounding in pass 1.
-This gives the same numerical stability as the two-pass float approach.
-
-**Why this is faster:** at 64×64×3 (12,288 pixels), the moment pass does
-12,288 float FMAs in the general case vs 256 FMAs from the histogram.
-The gains grow with array size.
-
-### Three inner-loop paths (selected at runtime)
-
-| Path | When used | Key property |
-|---|---|---|
-| **Global** | `axes=None` | Single accumulator, straight loop, fully AVX2-vectorized |
-| **LastAxis** | e.g. `axes=(0,1)` on HxWxC | Stride-C column loops — no modulo, AVX2-vectorized |
-| **General** | Arbitrary axes | Precomputed `(flat_index, bucket)` pairs |
-
-For uint8, Global and LastAxis use the histogram path. General uses the
-direct loop (histogram doesn't simplify arbitrary reductions).
-
----
-
-## Performance
-
-Measured on two machines. All times in milliseconds.
-
-### Linux / GCC (flags: `-O3 -march=native -ffast-math`)
-
-**Global moments — `ts.compute(arr, axes=None)`**
-
-| shape | numpy | ts float64 | ts uint8 | f64 speedup | u8 speedup |
-|---|---|---|---|---|---|
-| 16×16×3 | 0.014 | 0.004 | 0.004 | 3.5× | 3.4× |
-| 32×32×3 | 0.020 | 0.009 | 0.005 | 2.3× | 4.2× |
-| 64×64×3 | 0.043 | 0.029 | 0.011 | 1.5× | 4.0× |
-| 128×128×3 | 0.586 | 0.105 | 0.020 | 5.6× | 29× |
-| 256×256×3 | 3.133 | 0.432 | 0.068 | 7.3× | **46×** |
-
-**Global + per-channel — `ts.compute(arr, axes=[None, (0,1)])`**
-
-| shape | numpy | ts float64 | ts uint8 | f64 speedup | u8 speedup |
-|---|---|---|---|---|---|
-| 16×16×3 | 0.041 | 0.009 | 0.011 | 4.7× | 3.9× |
-| 32×32×3 | 0.052 | 0.018 | 0.014 | 2.8× | 3.8× |
-| 64×64×3 | 0.087 | 0.059 | 0.024 | 1.5× | 3.6× |
-| 128×128×3 | 0.259 | 0.213 | 0.051 | 1.2× | 5.1× |
-| 256×256×3 | 3.403 | 0.918 | 0.177 | 3.7× | **19×** |
-
-### Windows / MSVC (flags: `/O2 /arch:AVX2 /fp:fast`)
-
-**Global moments — `ts.compute(arr, axes=None)`**
-
-| shape | numpy | ts float64 | ts uint8 | f64 speedup | u8 speedup |
-|---|---|---|---|---|---|
-| 16×16×3 | 0.016 | 0.004 | 0.003 | 4× | 5× |
-| 32×32×3 | 0.022 | 0.006 | 0.003 | 4× | 7× |
-| 64×64×3 | 0.035 | 0.019 | 0.006 | 1.8× | 6× |
-| 128×128×3 | 0.111 | 0.057 | 0.018 | 2× | 6× |
-| 256×256×3 | 2.244 | 0.232 | 0.059 | 10× | **34×** |
-
-### Stride accuracy (gaussian blob, uint8, vs full-image numpy)
-
-Stride subsamples the array in memory order without malloc or resize.
-Error vs computing on all pixels:
-
-| stride | mean err | variance err | m3 err | m4 err |
-|---|---|---|---|---|
-| 1 | 0 | 0 | 0 | ~1e-16 |
-| 2 | ~1e-4 | ~1e-4 | ~1e-4 | ~1e-4 |
-| 4 | ~1e-4 | ~1e-4 | ~1e-4 | ~1e-4 |
-| 8 | ~2e-4 | ~7e-4 | ~7e-4 | ~1e-3 |
-
-Stride ≤ 2 is recommended for gating/triggering use cases. Mean is the
-most robust moment; m3/m4 degrade faster at higher strides.
-
----
-
-## Install
-
-`tensorstats` is a C++ extension built with CMake. `pip install -e .`
-is the build step — it invokes CMake automatically via `scikit-build-core`.
-First build takes 30–60 seconds.
-
-### Common steps (all platforms)
+## Installation
 
 ```bash
-git clone https://github.com/PCJohn/tensorstats
-cd tensorstats
-pip install scikit-build-core nanobind
 pip install -e .
-python -c "import tensorstats; print('ok')"
 ```
 
-### Platform prerequisites
+Requires a C++17 compiler. Builds with AVX2 on GCC/Clang (`-O3 -march=native`) and MSVC (`/O2 /arch:AVX2`).
 
-**Linux (Ubuntu/Debian)**
-```bash
-sudo apt install build-essential cmake python3-dev
+## Quick start
+
+```python
+import tensorstats as ts
+import numpy as np
+
+# Stateless convenience function
+arr = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+result = ts.compute(arr, axes=[None, (0, 1)], stride=(4, 4, 1), grid=(4, 4, 2))
+
+result["global"]   # (4,)        — global moments over all pixels
+result["0,1"]      # (3, 4)      — per-channel moments (one row per channel)
+result["grid"]     # (16,16,4,4) — 16×16 spatial grid, 4 channel cells, 4 moments
+
+# Stateful — retain buffers across calls (~2x faster on the grid path)
+sc = ts.StatsComputer(
+    shape=(64, 64, 3),
+    axes=[None, (0, 1)],
+    stride=(4, 4, 1),
+    grid=(4, 4, 2),
+)
+for frame in frames:
+    result = sc.compute(frame)
+    # result["grid"] is a VIEW into retained memory — copy if keeping past next call
+    grid_copy = result["grid"].copy()
 ```
 
-**macOS**
-```bash
-xcode-select --install   # Xcode command-line tools (clang + make)
-brew install cmake
+## Output convention
+
+All results use **moments-last** layout: shape is `(*reduction_shape, n_moments)`.
+
+| Key | Shape | When |
+|-----|-------|------|
+| `"global"` | `(n_moments,)` | `axes` contains `None` |
+| `"0,1"` | `(C, n_moments)` | `axes` contains `(0,1)` |
+| `"grid"` | `(*cell_shape, n_moments)` | `grid` is set |
+
+Moment layout (last axis):
+
+```
+[..., 0]  mean
+[..., 1]  variance (2nd central moment)
+[..., 2]  3rd central moment
+[..., 3]  4th central moment
 ```
 
-**Windows**
+Derived quantities:
 
-1. Install [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
-   — select the **"Desktop development with C++"** workload (installs MSVC + Windows SDK)
-2. Install [CMake](https://cmake.org/download/) — check "Add CMake to system PATH"
-3. **Open "Developer Command Prompt for VS 2022"** from the Start menu.
-   Regular PowerShell/CMD will fail — CMake needs the VS environment to find the compiler.
-4. Run the common steps above from that prompt.
-
----
+```python
+std      = np.sqrt(result["global"][1])
+skewness = result["global"][2] / std**3
+kurtosis = result["global"][3] / result["global"][1]**2
+```
 
 ## API
 
-### `ts.compute(arr, axes=None, stride=None, n_moments=4)`
-
-Compute the first `n_moments` central moments of `arr` for each requested
-axis-set.
-
-**Parameters**
-
-| param | type | description |
-|---|---|---|
-| `arr` | `np.ndarray` | Input array. uint8, float32, float64 accepted natively (no copy). Other dtypes cast to float64. |
-| `axes` | see below | Which axis-sets to reduce over. |
-| `stride` | `int` or `tuple[int,...]` | Subsample the array — skip elements without malloc or resize. `None` or `1` = use all elements. Scalar applies to all axes; tuple applies per-axis. |
-| `n_moments` | `int` | Number of moments to compute (1–4, default 4). |
-
-**`axes` argument**
-
-| value | meaning |
-|---|---|
-| `None` | global — reduce over all axes |
-| `int` | reduce over that single axis |
-| `(int, int, ...)` | reduce over those axes jointly |
-| `[spec, spec, ...]` | compute multiple reductions in one call |
-
-**Returns**
-
-`dict[str, np.ndarray]` — one entry per requested reduction.
-
-| key | output shape | example |
-|---|---|---|
-| `"global"` | `(n_moments,)` | all-axes reduction |
-| `"0,1"` | `(n_moments, C)` | axes (0,1) reduced — per-channel for HxWxC |
-| `"0"` | `(n_moments, W, C)` | axis 0 reduced |
-
-**Moments layout (axis 0 of each output array)**
-
-| index | meaning | standardised form |
-|---|---|---|
-| 0 | mean | — |
-| 1 | 2nd central moment (variance) | — |
-| 2 | 3rd central moment | skewness = `m[2] / sqrt(m[1])**3` |
-| 3 | 4th central moment | kurtosis = `m[3] / m[1]**2` |
-
----
-
-## Usage examples
+### `ts.StatsComputer` — stateful, preferred for repeated calls
 
 ```python
-import numpy as np
-import tensorstats as ts
-
-img = cv2.imread("frame.jpg")   # (H, W, 3) uint8 — accepted natively
-
-# --- Single reduction ---
-result = ts.compute(img, axes=None)
-result["global"]      # shape (4,): [mean, variance, m3, m4] over all pixels
-
-# --- Multiple reductions in one call ---
-result = ts.compute(img, axes=[None, (0, 1), 0])
-result["global"]      # shape (4,)    — global stats
-result["0,1"]         # shape (4, 3)  — per-channel stats
-result["0"]           # shape (4, W, 3) — per-column stats
-
-# --- Derived standardised moments ---
-m = result["global"]
-std      = np.sqrt(m[1])
-skewness = m[2] / std**3
-kurtosis = m[3] / m[1]**2
-
-# --- Stride: subsample without malloc/resize ---
-# scalar stride: flat memory step  data[0], data[s], data[2s], ...
-ts.compute(img, axes=None, stride=2)         # ~1.5× faster, small error
-
-# tuple stride: per-axis  — skip rows/cols, keep all channels
-ts.compute(img, axes=None, stride=(2, 2, 1))
-
-# --- Fewer moments (faster if you only need mean + variance) ---
-ts.compute(img, axes=None, n_moments=2)      # returns shape (2,)
+sc = ts.StatsComputer(
+    shape,       # tuple — fixed input shape, e.g. (64, 64, 3)
+    axes=None,   # None=global, int, tuple, or list of specs e.g. [None, (0,1)]
+    stride=None, # None/1=no stride, int, or per-axis tuple e.g. (4,4,1)
+    grid=None,   # None=no grid, int k (2^k cells/axis), or tuple e.g. (4,4,2)
+    n_moments=4, # 1–4
+)
+result = sc.compute(arr)      # arr must match shape; returns dict[str, ndarray]
+sc.set_shape((128, 128, 3))   # change shape, reallocates grid buffers
+sc.set_grid((3, 3, 2))        # change grid config only
 ```
 
-**Note on stride semantics:** scalar `stride=s` steps through the flat
-C-contiguous array (`data[0], data[s], data[2s], ...`). This is not the
-same as `arr[::s, ::s, ::s]` (per-axis numpy slicing). Use a tuple to
-stride specific axes independently.
+### `ts.compute` — stateless convenience wrapper
 
-**Note on resize/interpolation:** when passing a downsampled thumbnail,
-the interpolation method affects which features survive:
-- `cv2.INTER_NEAREST` — no blending, preserves sharp edges (good for feature-based stats)
-- `cv2.INTER_AREA` — anti-aliased (good for photometric stats)
-
----
-
-## Running tests
-
-```bash
-pip install pytest
-python -m pytest tests/ -v -s
+```python
+result = ts.compute(arr, axes=None, stride=None, n_moments=4, grid=None)
 ```
 
-Tests cover: correctness vs numpy reference, numerical stability
-(near-constant, large values, flat images, gradients), stride accuracy,
-native dtype handling (uint8/float32), all image edge cases
-(all-zeros, all-255, gaussian blob, checkerboard, two-tone), and latency
-benchmarks asserting tensorstats beats numpy.
+Creates a temporary `StatsComputer` and returns independent copies of all outputs. Use `StatsComputer` directly when calling in a loop.
 
----
+### Grid parameters
 
-## License
+`grid[d] = k` means `2**k` cells along axis `d`. `grid=(4,4,2)` on a `(H,W,C)` array gives `16×16` spatial cells and `4` channel cells (only 3 populated for `C=3`).
 
-Apache 2.0
+Cell boundaries use integer division: `cell_of[coord, d] = coord * n_cells[d] / shape[d]`. For `C=3` with `n_cells[C]=4`: channel 0→cell 0, channel 1→cell 1, channel 2→cell 2, cell 3 empty.
+
+## Performance
+
+Benchmark on Linux (GCC -O3 -march=native), `axes=[None,(0,1)], grid=(4,4,2)`, p50 latency:
+
+| Shape | dtype | stride | `ts.compute` | `StatsComputer` | speedup |
+|-------|-------|--------|-------------|-----------------|---------|
+| 64×64×3 | uint8 | 1 | 0.216ms | 0.129ms | 1.67× |
+| 64×64×3 | uint8 | 2 | 0.328ms | 0.252ms | 1.30× |
+| 64×64×3 | uint8 | 4 | 0.237ms | 0.143ms | 1.66× |
+| 64×64×3 | float64 | 1 | 0.218ms | 0.135ms | 1.62× |
+| 64×64×3 | float64 | 2 | 0.270ms | 0.171ms | 1.58× |
+| 64×64×3 | float64 | 4 | 0.170ms | 0.084ms | 2.03× |
+| 128×128×3 | uint8 | 1 | 0.765ms | 0.471ms | 1.63× |
+| 128×128×3 | uint8 | 2 | 1.258ms | 0.974ms | 1.29× |
+| 128×128×3 | uint8 | 4 | 0.833ms | 0.541ms | 1.54× |
+| 128×128×3 | float64 | 1 | 0.813ms | 0.509ms | 1.60× |
+| 128×128×3 | float64 | 2 | 0.965ms | 0.663ms | 1.46× |
+| 128×128×3 | float64 | 4 | 0.588ms | 0.293ms | 2.01× |
+
+The `StatsComputer` speedup comes from two sources:
+- **Retained `cell_of[]` array** (int16, precomputed flat cell indices) — eliminates per-pixel index arithmetic in the scatter loops
+- **Retained output buffer** returned as a zero-copy view — eliminates `new double[]` allocation and nanobind ndarray construction per call
+
+## Implementation notes
+
+**uint8 histogram path** (global and per-channel reductions): builds a `hist[256]` then computes moments with 256 FMAs instead of N float operations. Uses 4-way parallel counters to reduce write-after-write stalls. Faster than two-pass float for `N >= 256` pixels.
+
+**Grid path**: single forward pass over all pixels scattering into per-cell accumulators via `cell_of[i]` lookup, followed by a finalisation pass over cells. The precomputed `cell_of[]` (int16, 24KB for 64×64×3) fits in L1 cache and is retained across calls by `StatsComputer`.
+
+**Stride**: subsamples the input before computation. `stride=(4,4,1)` on `(64,64,3)` reads every 4th row and column but all channels, giving a 16× reduction in pixel count with proportional speed increase.

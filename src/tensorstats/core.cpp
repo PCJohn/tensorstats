@@ -7,11 +7,9 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
-#include <numeric>
 #include <string>
 #include <cstdint>
 
-// Portable no-alias hint
 #if defined(_MSC_VER)
 #  define TS_RESTRICT __restrict
 #else
@@ -21,33 +19,30 @@
 namespace nb = nanobind;
 
 // ---------------------------------------------------------------------------
-// tensorstats — fast two-pass central moment computation
+// tensorstats — fast central moment computation
 //
-// Output convention: moments-LAST. All output arrays have shape
-//   (*reduction_output_shape, n_moments)
-// e.g. global → (n_moments,), per-channel → (C, n_moments),
-//      grid   → (g0_cells, g1_cells, ..., n_moments)
+// Output convention: moments-LAST
+//   global reduction → (n_moments,)
+//   per-channel      → (C, n_moments)
+//   grid             → (*cell_shape, n_moments)
 //
-// Algorithm: two-pass, numerically stable:
-//   Pass 1: mean per bucket  — pure sum, SIMD-vectorized
-//   Pass 2: d=x-mu, accumulate d^2, d^2*d, d^2*d^2 — 4 FMAs/element
+// Moments layout: [0]=mean  [1]=variance  [2]=m3  [3]=m4
+//   std      = sqrt(m[1])
+//   skewness = m[2] / std^3
+//   kurtosis = m[3] / m[1]^2
 //
-// Specialised paths (selected at runtime):
-//   Global    — single accumulator, straight loop, AVX2-vectorized
-//   LastAxis  — stride-C column loops (no modulo), AVX2-vectorized
-//   General   — iterative (flat_idx, bucket) pair enumeration, arbitrary axes
-//   Grid      — power-of-2 cell grid; iterative per-cell enumeration;
-//               histogram path when pixels/cell >= 256 (uint8 only),
-//               direct two-pass otherwise. Crossover benchmarked at ~256px/cell.
+// Computation paths (selected at runtime):
+//   Global    — straight SIMD loop over all elements
+//   LastAxis  — stride-C column loops, no modulo
+//   General   — iterative (flat_idx, bucket) enumeration for arbitrary axes
+//   Grid      — pixel-outer scatter into per-cell accumulators;
+//               precomputed int16 cell_of[] eliminates per-pixel arithmetic
 //
-// uint8 histogram path (Global + LastAxis + large Grid cells):
-//   Replaces N float FMAs with N integer increments + 256 float FMAs.
-//   4-way parallel counters (h0/h1/h2/h3) reduce write-after-write stalls.
-//   Mean from exact integer sum — no float rounding in pass 1.
-//
-// No std::function used anywhere — all iteration is explicit to avoid
-// virtual-dispatch overhead (~5x on grid collect, ~1.6x on pair enumeration).
+// uint8 histogram path (Global + LastAxis):
+//   N integer increments + 256 float FMAs per reduction.
+//   4-way parallel counters reduce write-after-write stalls.
 // ---------------------------------------------------------------------------
+
 
 // ---------------------------------------------------------------------------
 // uint8 histogram helpers
@@ -86,11 +81,8 @@ static void global_u8_hist(const uint8_t* TS_RESTRICT d, int64_t n, int64_t step
         build_hist4(d,n,hist);
         moments_from_hist(hist,n,mu,m2,m3,m4);
     } else {
-        // 4-way parallel strided histogram: same write-conflict reduction as
-        // build_hist4 but with step spacing between lanes (~1.1x faster).
         int64_t h0[256]={},h1[256]={},h2[256]={},h3[256]={};
-        int64_t step4=step*4, ns=0;
-        int64_t i=0, n4=(n/step4)*step4;
+        int64_t step4=step*4, ns=0, i=0, n4=(n/step4)*step4;
         for(;i<n4;i+=step4){
             h0[d[i]]++;h1[d[i+step]]++;h2[d[i+step*2]]++;h3[d[i+step*3]]++;
             ns+=4;
@@ -113,8 +105,9 @@ static void last_axis_u8_hist(const uint8_t* TS_RESTRICT d,
     }
 }
 
+
 // ---------------------------------------------------------------------------
-// Sampled flat index list — only used for non-uniform strides (rare path)
+// Sampled flat index list — used only for non-uniform strides
 // ---------------------------------------------------------------------------
 static std::vector<int64_t> sampled_indices(const std::vector<int64_t> &shape,
                                              const std::vector<int64_t> &stride)
@@ -124,11 +117,9 @@ static std::vector<int64_t> sampled_indices(const std::vector<int64_t> &shape,
     for(int d=0;d<ndim;++d) cap*=(shape[d]+stride[d]-1)/stride[d];
     std::vector<int64_t> result; result.reserve(cap);
 
-    // C-order flat strides
     std::vector<int64_t> fs(ndim,1);
     for(int d=ndim-2;d>=0;--d) fs[d]=fs[d+1]*shape[d+1];
 
-    // Explicit coordinate iteration — no std::function
     std::vector<int64_t> coords(ndim,0);
     int64_t flat=0;
     while(true){
@@ -143,6 +134,7 @@ static std::vector<int64_t> sampled_indices(const std::vector<int64_t> &shape,
     }
     return result;
 }
+
 
 // ---------------------------------------------------------------------------
 // Inner loop kernels
@@ -220,6 +212,7 @@ static void general_pass(const T* TS_RESTRICT data,
     }
 }
 
+
 // ---------------------------------------------------------------------------
 // Axis spec
 // ---------------------------------------------------------------------------
@@ -237,12 +230,18 @@ static AxisSpec make_axis_spec(const std::vector<int> &axes,
 {
     int ndim=(int)shape.size();
     AxisSpec s;
-    for(int a:axes){ int na=(a<0)?a+ndim:a; if(na<0||na>=ndim) throw std::out_of_range("axis out of range"); s.reduce_axes.push_back(na); }
+    for(int a:axes){
+        int na=(a<0)?a+ndim:a;
+        if(na<0||na>=ndim) throw std::out_of_range("axis out of range");
+        s.reduce_axes.push_back(na);
+    }
     std::sort(s.reduce_axes.begin(),s.reduce_axes.end());
-    s.reduce_axes.erase(std::unique(s.reduce_axes.begin(),s.reduce_axes.end()),s.reduce_axes.end());
+    s.reduce_axes.erase(std::unique(s.reduce_axes.begin(),s.reduce_axes.end()),
+                        s.reduce_axes.end());
     s.acc_size=1;
     for(int d=0;d<ndim;++d){
-        bool red=std::find(s.reduce_axes.begin(),s.reduce_axes.end(),d)!=s.reduce_axes.end();
+        bool red=std::find(s.reduce_axes.begin(),s.reduce_axes.end(),d)
+                 !=s.reduce_axes.end();
         if(!red){s.out_shape.push_back(shape[d]);s.acc_size*=shape[d];}
     }
     s.out_strides.resize(s.out_shape.size(),1);
@@ -256,41 +255,34 @@ static AxisSpec make_axis_spec(const std::vector<int> &axes,
     return s;
 }
 
-// Build (flat_idx, bucket_idx) pairs for all sampled elements.
-// Fully iterative — no std::function, no recursion overhead (~1.6x faster).
+// Build (flat_idx, bucket_idx) pairs for the general axes path.
+// Fully iterative — no std::function (~1.6x faster than recursive lambda).
 static std::vector<std::pair<int64_t,int64_t>> make_pairs(
     const std::vector<int64_t> &shape, const std::vector<int64_t> &stride,
     const std::vector<int> &reduce_axes, const std::vector<int64_t> &out_strides)
 {
     int ndim=(int)shape.size();
-
-    // Precompute per-dim: is_reduced, output_dim_index, C-order flat stride
     std::vector<bool>    is_red(ndim, false);
-    std::vector<int64_t> odim(ndim, -1);   // output dim index for non-reduced dims
-    std::vector<int64_t> fs(ndim, 1);      // C-order flat strides
-
+    std::vector<int64_t> odim(ndim, -1);
+    std::vector<int64_t> fs(ndim, 1);
     for(int a:reduce_axes) is_red[a]=true;
     int od=0; for(int d=0;d<ndim;++d) if(!is_red[d]) odim[d]=od++;
     for(int d=ndim-2;d>=0;--d) fs[d]=fs[d+1]*shape[d+1];
-
     int64_t cap=1;
     for(int d=0;d<ndim;++d) cap*=(shape[d]+stride[d]-1)/stride[d];
     std::vector<std::pair<int64_t,int64_t>> pairs;
     pairs.reserve(cap);
-
-    // Explicit coordinate iteration
     std::vector<int64_t> coords(ndim,0);
     int64_t flat=0, bkt=0;
     while(true){
         pairs.push_back({flat,bkt});
         int d=ndim-1;
         while(d>=0){
-            coords[d]+=stride[d];
-            flat+=stride[d]*fs[d];
-            if(!is_red[d] && odim[d]>=0) bkt+=stride[d]*out_strides[odim[d]];
+            coords[d]+=stride[d]; flat+=stride[d]*fs[d];
+            if(!is_red[d]&&odim[d]>=0) bkt+=stride[d]*out_strides[odim[d]];
             if(coords[d]<shape[d]) break;
             flat-=coords[d]*fs[d];
-            if(!is_red[d] && odim[d]>=0) bkt-=coords[d]*out_strides[odim[d]];
+            if(!is_red[d]&&odim[d]>=0) bkt-=coords[d]*out_strides[odim[d]];
             coords[d]=0; --d;
         }
         if(d<0) break;
@@ -298,9 +290,9 @@ static std::vector<std::pair<int64_t,int64_t>> make_pairs(
     return pairs;
 }
 
+
 // ---------------------------------------------------------------------------
-// Pack — moments-LAST: (*out_shape, n_moments)
-// Flat layout: ptr[cell_flat * n_moments + k]
+// Pack — write accumulated moments into a new heap-allocated ndarray
 // ---------------------------------------------------------------------------
 static nb::ndarray<nb::numpy,double> pack(
     const std::vector<double> &mu, const std::vector<double> &m2,
@@ -321,136 +313,9 @@ static nb::ndarray<nb::numpy,double> pack(
     return nb::ndarray<nb::numpy,double>(ptr,sh.size(),sh.data(),own);
 }
 
-// ---------------------------------------------------------------------------
-// Grid computation
-//
-// grid[d] = log2 of number of cells along axis d (0 = no subdivision).
-//   0 → 1 cell,  1 → 2 cells,  k → 2^k cells
-//
-// Cell boundaries: lo = cell_idx * shape[d] / n_cells[d]  (works for any shape)
-//
-// uint8 histogram path: cells with >= HIST_THRESHOLD pixels (benchmarked crossover).
-// Direct two-pass: small cells and all float types.
-//
-// Flat index collection is fully iterative (no std::function) — ~5.8x faster
-// than the recursive lambda approach, measured on 8x8 grid of 64x64 image.
-// ---------------------------------------------------------------------------
-
-static constexpr int64_t HIST_THRESHOLD = 256;
-
-template<typename T>
-static void compute_cell_direct(const T* TS_RESTRICT data,
-                                  const std::vector<int64_t> &idx,
-                                  double &mu, double &m2, double &m3, double &m4)
-{
-    int64_t n=(int64_t)idx.size(); double s=0;
-    for(int64_t fi:idx) s+=(double)data[fi];
-    mu=s/(double)n; m2=m3=m4=0;
-    for(int64_t fi:idx){ double d=(double)data[fi]-mu,d2=d*d; m2+=d2;m3+=d2*d;m4+=d2*d2; }
-    double inv=1.0/(double)n; m2*=inv; m3*=inv; m4*=inv;
-}
-
-template<typename T>
-static nb::ndarray<nb::numpy,double> compute_grid_typed(
-    const T* TS_RESTRICT data,
-    const std::vector<int64_t> &shape,
-    const std::vector<int>     &grid,
-    int n_moments)
-{
-    int ndim=(int)shape.size();
-
-    std::vector<int64_t> n_cells(ndim);
-    for(int d=0;d<ndim;++d) n_cells[d]=(int64_t)1<<grid[d];
-
-    int64_t total_cells=1;
-    for(int d=0;d<ndim;++d) total_cells*=n_cells[d];
-
-    // C-order flat strides of input array
-    std::vector<int64_t> fs(ndim,1);
-    for(int d=ndim-2;d>=0;--d) fs[d]=fs[d+1]*shape[d+1];
-
-    // Allocate output: (*n_cells, n_moments)
-    std::vector<size_t> out_sh;
-    for(int d=0;d<ndim;++d) out_sh.push_back((size_t)n_cells[d]);
-    out_sh.push_back((size_t)n_moments);
-    auto *ptr=new double[(size_t)total_cells*(size_t)n_moments];
-
-    // Preallocate flat_indices buffer — reused across cells
-    // Max cell size = total elements / total_cells (when all cells equal size)
-    int64_t total=1; for(auto s:shape) total*=s;
-    int64_t max_cell_size = (total + total_cells - 1) / total_cells * 2;
-    std::vector<int64_t> flat_indices;
-    flat_indices.reserve((size_t)max_cell_size);
-
-    // Precompute cell boundaries per axis per cell index
-    // lo[d][ci] = ci * shape[d] / n_cells[d]
-    std::vector<std::vector<int64_t>> lo(ndim), hi(ndim);
-    for(int d=0;d<ndim;++d){
-        lo[d].resize(n_cells[d]); hi[d].resize(n_cells[d]);
-        for(int64_t ci=0;ci<n_cells[d];++ci){
-            lo[d][ci] = ci * shape[d] / n_cells[d];
-            hi[d][ci] = (ci+1) * shape[d] / n_cells[d];
-        }
-    }
-
-    // Iterate over all cells
-    std::vector<int64_t> cell_coords(ndim,0);
-
-    for(int64_t cell=0; cell<total_cells; ++cell){
-        // Collect flat indices for this cell — fully iterative
-        flat_indices.clear();
-        std::vector<int64_t> elem_coords(ndim);
-        for(int d=0;d<ndim;++d) elem_coords[d]=lo[d][cell_coords[d]];
-
-        int64_t elem_flat=0;
-        for(int d=0;d<ndim;++d) elem_flat+=elem_coords[d]*fs[d];
-
-        // Iterate elements within the cell bounds
-        while(true){
-            flat_indices.push_back(elem_flat);
-            int d=ndim-1;
-            while(d>=0){
-                ++elem_coords[d]; elem_flat+=fs[d];
-                if(elem_coords[d]<hi[d][cell_coords[d]]) break;
-                elem_flat-=(elem_coords[d]-lo[d][cell_coords[d]])*fs[d];
-                elem_coords[d]=lo[d][cell_coords[d]]; --d;
-            }
-            if(d<0) break;
-        }
-
-        double mu=0,m2=0,m3=0,m4=0;
-        if constexpr (std::is_same_v<T, uint8_t>) {
-            int64_t n=(int64_t)flat_indices.size();
-            if(n>=HIST_THRESHOLD){
-                int64_t hist[256]={};
-                for(int64_t fi:flat_indices) hist[data[fi]]++;
-                moments_from_hist(hist,n,mu,m2,m3,m4);
-            } else {
-                compute_cell_direct<T>(data,flat_indices,mu,m2,m3,m4);
-            }
-        } else {
-            compute_cell_direct<T>(data,flat_indices,mu,m2,m3,m4);
-        }
-
-        double *out=ptr+cell*n_moments;
-        if(n_moments>=1) out[0]=mu;
-        if(n_moments>=2) out[1]=m2;
-        if(n_moments>=3) out[2]=m3;
-        if(n_moments>=4) out[3]=m4;
-
-        // Advance cell_coords
-        for(int d=ndim-1;d>=0;--d){
-            if(++cell_coords[d]<n_cells[d]) break;
-            cell_coords[d]=0;
-        }
-    }
-
-    nb::capsule own(ptr,[](void*p)noexcept{delete[]static_cast<double*>(p);});
-    return nb::ndarray<nb::numpy,double>(ptr,out_sh.size(),out_sh.data(),own);
-}
 
 // ---------------------------------------------------------------------------
-// Main typed entry point
+// Axes reduction entry point (global, per-channel, general)
 // ---------------------------------------------------------------------------
 template<typename T>
 static nb::dict compute_typed(
@@ -477,11 +342,17 @@ static nb::dict compute_typed(
             if constexpr (std::is_same_v<T, uint8_t>) {
                 if(!has_stride||uniform_stride)
                     global_u8_hist(data,total,uniform_stride?s0:1,mu,m2,m3,m4);
-                else { auto idx=sampled_indices(shape,stride); global_pass_idx<T>(data,idx,mu,m2,m3,m4); }
+                else {
+                    auto idx=sampled_indices(shape,stride);
+                    global_pass_idx<T>(data,idx,mu,m2,m3,m4);
+                }
             } else {
                 if(!has_stride) global_pass<T>(data,total,1,mu,m2,m3,m4);
                 else if(uniform_stride) global_pass<T>(data,total,s0,mu,m2,m3,m4);
-                else { auto idx=sampled_indices(shape,stride); global_pass_idx<T>(data,idx,mu,m2,m3,m4); }
+                else {
+                    auto idx=sampled_indices(shape,stride);
+                    global_pass_idx<T>(data,idx,mu,m2,m3,m4);
+                }
             }
             std::vector<size_t> sh={(size_t)n_moments};
             auto *p=new double[n_moments];
@@ -514,24 +385,225 @@ static nb::dict compute_typed(
                     else if(simple_hw_stride&&ndim_red==1)
                         last_axis_u8_hist(data,HW,spec.last_dim_C,
                             stride[spec.reduce_axes[0]],stride[ndim-1],mu,m2,m3,m4);
-                    else { auto p=make_pairs(shape,stride,spec.reduce_axes,spec.out_strides); general_pass<T>(data,p,nacc,mu,m2,m3,m4); }
+                    else {
+                        auto p=make_pairs(shape,stride,spec.reduce_axes,spec.out_strides);
+                        general_pass<T>(data,p,nacc,mu,m2,m3,m4);
+                    }
                 } else if(!has_stride)
                     last_axis_pass<T>(data,HW,spec.last_dim_C,1,1,mu,m2,m3,m4);
                 else if(simple_hw_stride&&ndim_red==1)
-                    last_axis_pass<T>(data,HW,spec.last_dim_C,stride[spec.reduce_axes[0]],stride[ndim-1],mu,m2,m3,m4);
-                else { auto p=make_pairs(shape,stride,spec.reduce_axes,spec.out_strides); general_pass<T>(data,p,nacc,mu,m2,m3,m4); }
+                    last_axis_pass<T>(data,HW,spec.last_dim_C,
+                        stride[spec.reduce_axes[0]],stride[ndim-1],mu,m2,m3,m4);
+                else {
+                    auto p=make_pairs(shape,stride,spec.reduce_axes,spec.out_strides);
+                    general_pass<T>(data,p,nacc,mu,m2,m3,m4);
+                }
             } else {
                 auto p=make_pairs(shape,stride,spec.reduce_axes,spec.out_strides);
                 general_pass<T>(data,p,nacc,mu,m2,m3,m4);
             }
 
             std::string key;
-            for(int i=0;i<(int)raw_axes.size();++i){ if(i)key+=","; key+=std::to_string(raw_axes[i]); }
+            for(int i=0;i<(int)raw_axes.size();++i){
+                if(i)key+=","; key+=std::to_string(raw_axes[i]);
+            }
             result[key.c_str()]=pack(mu,m2,m3,m4,spec.out_shape,nacc,n_moments);
         }
     }
     return result;
 }
+
+
+// ---------------------------------------------------------------------------
+// _GridComputerImpl — internal stateful grid moment computer.
+//
+// Not exposed publicly. Used exclusively by StatsComputer (Python) via
+// the _GridComputerImpl nanobind binding.
+//
+// Retained across compute() calls (for fixed shape+grid):
+//   cell_of_[]  int16 flat cell index per pixel. Precomputed at construction.
+//               Eliminates per-pixel index arithmetic in scatter loops.
+//               Range [0, total_cells-1] always fits int16 (total_cells <= 32767).
+//   sums_, counts_, mu_, m2_, m3_, m4_  Accumulator vectors (total_cells each).
+//               Zero-filled each call instead of reallocated.
+//   out_buf_[]  Output buffer (total_cells * n_moments doubles).
+//               compute_u8 / compute_f64 return a VIEW into this buffer
+//               (nb::none() owner). Zero allocation per call.
+//
+// Grid cell assignment:
+//   cell_of[pixel] = sum_d( (coord[d] * n_cells[d] / shape[d]) * cell_stride[d] )
+//   where n_cells[d] = 2^grid[d], division is integer (uniform split).
+//
+// uint8 histogram path (use_hist_ = pixels_per_cell >= 256):
+//   Per-cell hist[256] in hists_ vector. Single scatter pass + 256 FMA finalise.
+//   Faster than two-pass scatter for large cells.
+//
+// Direct two-pass (small cells, float types):
+//   Pass 1: scatter pixel values → per-cell sums. Compute means.
+//   Pass 2: scatter (pixel - mean)^k → per-cell moment accumulators.
+// ---------------------------------------------------------------------------
+static constexpr int64_t HIST_THRESHOLD = 256;
+
+class _GridComputerImpl {
+    std::vector<int64_t> shape_, grid_;
+    std::vector<size_t>  out_shape_;
+    int64_t total_       = 0;
+    int64_t total_cells_ = 0;
+    int64_t n_moments_   = 4;
+    bool    use_hist_    = false;
+
+    std::vector<int16_t> cell_of_;
+    std::vector<double>  sums_, mu_, m2_, m3_, m4_, out_buf_;
+    std::vector<int64_t> counts_, hists_;
+
+    void _rebuild(const std::vector<int64_t>& shape,
+                  const std::vector<int>&     grid,
+                  int n_moments)
+    {
+        shape_     = shape;
+        grid_      = std::vector<int64_t>(grid.begin(), grid.end());
+        n_moments_ = n_moments;
+        int ndim   = (int)shape.size();
+
+        std::vector<int64_t> n_cells(ndim), cs(ndim,1);
+        for(int d=0;d<ndim;++d) n_cells[d]=(int64_t)1<<grid[d];
+        total_cells_=1;
+        for(int d=0;d<ndim;++d) total_cells_*=n_cells[d];
+        for(int d=ndim-2;d>=0;--d) cs[d]=cs[d+1]*n_cells[d+1];
+
+        total_=1; for(auto s:shape) total_*=s;
+        int64_t px_per_cell=(total_cells_>0)?(total_/total_cells_):0;
+        use_hist_=(px_per_cell>=HIST_THRESHOLD);
+
+        if(total_cells_ > 32767)
+            throw std::runtime_error("_GridComputerImpl: total_cells exceeds int16 range");
+
+        // Per-axis luts then flatten to cell_of_
+        std::vector<std::vector<int64_t>> lut(ndim);
+        for(int d=0;d<ndim;++d){
+            lut[d].resize(shape[d]);
+            for(int64_t i=0;i<shape[d];++i)
+                lut[d][i]=i*n_cells[d]/shape[d];
+        }
+        cell_of_.resize(total_);
+        std::vector<int64_t> coords(ndim,0);
+        for(int64_t flat=0;flat<total_;++flat){
+            int64_t cell=0;
+            for(int d=0;d<ndim;++d) cell+=lut[d][coords[d]]*cs[d];
+            cell_of_[flat]=(int16_t)cell;
+            for(int d=ndim-1;d>=0;--d){
+                if(++coords[d]<shape[d]) break;
+                coords[d]=0;
+            }
+        }
+
+        sums_.assign(total_cells_,0.0);
+        mu_.assign(total_cells_,0.0);
+        m2_.assign(total_cells_,0.0);
+        m3_.assign(total_cells_,0.0);
+        m4_.assign(total_cells_,0.0);
+        counts_.assign(total_cells_,0);
+        if(use_hist_) hists_.assign(total_cells_*256,0);
+        out_buf_.resize(total_cells_*n_moments_);
+
+        out_shape_.clear();
+        for(int d=0;d<ndim;++d) out_shape_.push_back((size_t)n_cells[d]);
+        out_shape_.push_back((size_t)n_moments_);
+    }
+
+    nb::ndarray<nb::numpy,double> _view() {
+        return nb::ndarray<nb::numpy,double>(
+            out_buf_.data(), out_shape_.size(), out_shape_.data(), nb::none());
+    }
+
+    void _pack_direct(int64_t c){
+        if(!counts_[c]) return;
+        double inv=1.0/(double)counts_[c];
+        double* out=out_buf_.data()+c*n_moments_;
+        if(n_moments_>=1) out[0]=mu_[c];
+        if(n_moments_>=2) out[1]=m2_[c]*inv;
+        if(n_moments_>=3) out[2]=m3_[c]*inv;
+        if(n_moments_>=4) out[3]=m4_[c]*inv;
+    }
+
+public:
+    _GridComputerImpl() = default;
+
+    void set_config(const std::vector<int64_t>& shape,
+                    const std::vector<int>&     grid,
+                    int n_moments=4)
+    {
+        _rebuild(shape, grid, n_moments);
+    }
+
+    nb::ndarray<nb::numpy,double> compute_u8(const uint8_t* TS_RESTRICT data)
+    {
+        if(use_hist_){
+            std::fill(hists_.begin(),hists_.end(),0);
+            std::fill(counts_.begin(),counts_.end(),0);
+            for(int64_t i=0;i<total_;++i){
+                int16_t cell=cell_of_[i];
+                hists_[cell*256+data[i]]++;
+                counts_[cell]++;
+            }
+            for(int64_t cell=0;cell<total_cells_;++cell){
+                if(!counts_[cell]) continue;
+                double mu,m2,m3,m4;
+                moments_from_hist(hists_.data()+cell*256,counts_[cell],mu,m2,m3,m4);
+                double* out=out_buf_.data()+cell*n_moments_;
+                if(n_moments_>=1) out[0]=mu;
+                if(n_moments_>=2) out[1]=m2;
+                if(n_moments_>=3) out[2]=m3;
+                if(n_moments_>=4) out[3]=m4;
+            }
+        } else {
+            std::fill(sums_.begin(),sums_.end(),0.0);
+            std::fill(counts_.begin(),counts_.end(),0);
+            for(int64_t i=0;i<total_;++i){
+                sums_[cell_of_[i]]+=(double)data[i];
+                counts_[cell_of_[i]]++;
+            }
+            for(int64_t c=0;c<total_cells_;++c)
+                mu_[c]=counts_[c]>0?sums_[c]/(double)counts_[c]:0.0;
+            std::fill(m2_.begin(),m2_.end(),0.0);
+            std::fill(m3_.begin(),m3_.end(),0.0);
+            std::fill(m4_.begin(),m4_.end(),0.0);
+            for(int64_t i=0;i<total_;++i){
+                int16_t cell=cell_of_[i];
+                double d=(double)data[i]-mu_[cell],d2=d*d;
+                m2_[cell]+=d2; m3_[cell]+=d2*d; m4_[cell]+=d2*d2;
+            }
+            for(int64_t c=0;c<total_cells_;++c) _pack_direct(c);
+        }
+        return _view();
+    }
+
+    nb::ndarray<nb::numpy,double> compute_f64(const double* TS_RESTRICT data)
+    {
+        std::fill(sums_.begin(),sums_.end(),0.0);
+        std::fill(counts_.begin(),counts_.end(),0);
+        for(int64_t i=0;i<total_;++i){
+            sums_[cell_of_[i]]+=(double)data[i];
+            counts_[cell_of_[i]]++;
+        }
+        for(int64_t c=0;c<total_cells_;++c)
+            mu_[c]=counts_[c]>0?sums_[c]/(double)counts_[c]:0.0;
+        std::fill(m2_.begin(),m2_.end(),0.0);
+        std::fill(m3_.begin(),m3_.end(),0.0);
+        std::fill(m4_.begin(),m4_.end(),0.0);
+        for(int64_t i=0;i<total_;++i){
+            int16_t cell=cell_of_[i];
+            double d=data[i]-mu_[cell],d2=d*d;
+            m2_[cell]+=d2; m3_[cell]+=d2*d; m4_[cell]+=d2*d2;
+        }
+        for(int64_t c=0;c<total_cells_;++c) _pack_direct(c);
+        return _view();
+    }
+
+    int64_t total_cells() const { return total_cells_; }
+    int64_t n_moments()   const { return n_moments_;   }
+};
+
 
 // ---------------------------------------------------------------------------
 // Public bindings
@@ -543,20 +615,13 @@ using ArrU8 =nb::ndarray<nb::numpy,uint8_t,nb::c_contig,nb::device::cpu>;
 #define MAKE_ENTRY(name, T, ArrT)                                              \
 nb::dict name(ArrT arr,                                                        \
               std::vector<std::vector<int>> axes,                              \
-              std::vector<int64_t> stride, int n_moments,                      \
-              std::vector<int> grid){                                           \
+              std::vector<int64_t> stride, int n_moments){                     \
     int ndim=(int)arr.ndim();                                                  \
     std::vector<int64_t> shape(ndim);                                          \
     for(int d=0;d<ndim;++d) shape[d]=arr.shape(d);                            \
     if((int)stride.size()!=ndim)                                               \
         throw std::invalid_argument("stride length must match ndim");          \
-    nb::dict result=compute_typed<T>(arr.data(),shape,axes,stride,n_moments);  \
-    if(!grid.empty()){                                                         \
-        if((int)grid.size()!=ndim)                                             \
-            throw std::invalid_argument("grid length must match ndim");        \
-        result["grid"]=compute_grid_typed<T>(arr.data(),shape,grid,n_moments); \
-    }                                                                          \
-    return result;                                                             \
+    return compute_typed<T>(arr.data(),shape,axes,stride,n_moments);           \
 }
 
 MAKE_ENTRY(compute_f64, double,  ArrF64)
@@ -564,23 +629,24 @@ MAKE_ENTRY(compute_f32, float,   ArrF32)
 MAKE_ENTRY(compute_u8,  uint8_t, ArrU8)
 
 NB_MODULE(tensorstats_core, m){
-    m.doc()=R"(
-Fast two-pass central moment computation. Moments-LAST output convention.
+    m.doc()="tensorstats internal C++ module. Use the Python API (ts.StatsComputer, ts.compute).";
 
-Output shapes (axes reduction):
-  "global"  → (n_moments,)
-  "0,1"     → (C, n_moments)       for axes=(0,1) on (H,W,C)
-  "0"       → (W, C, n_moments)    for axis=0 on (H,W,C)
+    // Axes reduction free functions (used by StatsComputer for global/per-channel)
+    m.def("compute_f64",&compute_f64,nb::arg("arr"),nb::arg("axes"),nb::arg("stride"),nb::arg("n_moments"));
+    m.def("compute_f32",&compute_f32,nb::arg("arr"),nb::arg("axes"),nb::arg("stride"),nb::arg("n_moments"));
+    m.def("compute_u8", &compute_u8, nb::arg("arr"),nb::arg("axes"),nb::arg("stride"),nb::arg("n_moments"));
 
-Output shape (grid):
-  "grid"    → (*cell_shape, n_moments)
-              e.g. (4,4,1,n_moments) for grid=(2,2,0) on (H,W,C)
-
-grid[d] = log2(cells along axis d). 0=no subdivision, 3=8 cells.
-uint8: histogram path for global, last-axis, and grid cells >= 256 pixels.
-All iteration is explicit (no std::function) for minimal call overhead.
-    )";
-    m.def("compute_f64",&compute_f64,nb::arg("arr"),nb::arg("axes"),nb::arg("stride"),nb::arg("n_moments"),nb::arg("grid"));
-    m.def("compute_f32",&compute_f32,nb::arg("arr"),nb::arg("axes"),nb::arg("stride"),nb::arg("n_moments"),nb::arg("grid"));
-    m.def("compute_u8", &compute_u8, nb::arg("arr"),nb::arg("axes"),nb::arg("stride"),nb::arg("n_moments"),nb::arg("grid"));
+    // Internal stateful grid computer (used by StatsComputer, not part of public API)
+    nb::class_<_GridComputerImpl>(m, "_GridComputerImpl")
+        .def(nb::init<>())
+        .def("set_config", &_GridComputerImpl::set_config,
+             nb::arg("shape"), nb::arg("grid"), nb::arg("n_moments")=4)
+        .def("compute_u8",
+             [](  _GridComputerImpl& self, ArrU8  arr){ return self.compute_u8(arr.data()); },
+             nb::arg("arr"))
+        .def("compute_f64",
+             [](  _GridComputerImpl& self, ArrF64 arr){ return self.compute_f64(arr.data()); },
+             nb::arg("arr"))
+        .def_prop_ro("total_cells", &_GridComputerImpl::total_cells)
+        .def_prop_ro("n_moments",   &_GridComputerImpl::n_moments);
 }
