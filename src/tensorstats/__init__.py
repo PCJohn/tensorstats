@@ -18,13 +18,14 @@ Usage:
   sc = ts.StatsComputer(
       shape=(64, 64, 3),
       axes=[None, (0, 1)],
-      stride=(4, 4, 1),
-      grid=(4, 4, 2),
+      stride=(4, 4, 1),       # subsamples the grid too (subsampled-exact)
+      grid=[(4, 4, 2), (5, 5, 0)],   # a grid pyramid: K levels in one pass
   )
   result = sc.compute(hsv_frame)   # reuses internal buffers every call
   result["global"]   # (4,)           exact global moments
   result["0,1"]      # (3, 4)         exact per-channel moments
-  result["grid"]     # (16,16,4,4)    exact grid moments
+  result["grid_0"]   # (16,16,4,4)    level 0 grid moments
+  result["grid_1"]   # (32,32,1,4)    level 1 grid moments
 """
 
 from __future__ import annotations
@@ -85,18 +86,30 @@ def _parse_stride(stride, ndim: int) -> list[int]:
     return sv
 
 
-def _parse_grid(grid, ndim: int) -> list[int]:
-    """grid[d]=k → 2^k cells along axis d. None or empty → no grid."""
+def _parse_grid(grid, ndim: int) -> list[list[int]]:
+    """Parse grid into a list of per-axis exponent vectors (grid[d]=k -> 2^k cells).
+
+    Accepts None (no grid), an int k, a single per-axis tuple/list, or a list of
+    such specs (a grid pyramid). Returns [] when there is no grid. A single spec
+    is the K=1 case of the same list-of-specs representation.
+    """
     if grid is None:
         return []
     if isinstance(grid, int):
-        return [grid] * ndim
+        return [[grid] * ndim]
     g = list(grid)
-    if len(g) != ndim:
-        raise ValueError(f"grid length {len(g)} must match ndim={ndim}")
-    if any(v < 0 for v in g):
-        raise ValueError("grid values must be >= 0")
-    return g
+    if not g:
+        return []
+    specs = g if isinstance(g[0], (tuple, list)) else [g]
+    out = []
+    for s in specs:
+        v = [s] * ndim if isinstance(s, int) else list(s)
+        if len(v) != ndim:
+            raise ValueError(f"grid spec length {len(v)} must match ndim={ndim}")
+        if any(x < 0 for x in v):
+            raise ValueError("grid values must be >= 0")
+        out.append([int(x) for x in v])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -117,14 +130,17 @@ class StatsComputer:
     shape     : tuple — every compute() call must pass an array with this shape.
     axes      : None=global, int, tuple, or list of specs e.g. [None, (0,1)].
     stride    : None/1=no stride, int, or per-axis tuple e.g. (4,4,1).
-    grid      : None=no grid, int k (2^k cells/axis), or per-axis tuple e.g. (4,4,2).
+    grid      : None=no grid, int k (2^k cells/axis), a per-axis tuple e.g.
+                (4,4,2), or a LIST of such specs e.g. [(4,4,2),(5,5,0)] for a
+                grid pyramid computed in a single pass. stride applies to the
+                grid too (subsampled-exact moments).
     n_moments : 1–4 (default 4).
 
     Result keys and shapes
     ----------------------
     "global"        (n_moments,)              when axes includes None
     "<a>,<b>,..."   (*kept_shape, n_moments)  for each axis-tuple in axes
-    "grid"          (*cell_shape, n_moments)  when grid is set
+    "grid_<i>"      (*cell_shape, n_moments)  one per grid level, i = 0..K-1
 
     Supported dtypes: uint8, float32, float64. Other dtypes are cast to float64.
     """
@@ -142,12 +158,15 @@ class StatsComputer:
         self._n_moments = n_moments
         self._axes_list = _parse_axes(axes, self._ndim)
         self._stride = _parse_stride(stride, self._ndim)
-        self._grid_vec = _parse_grid(grid, self._ndim)
-        self._has_grid = bool(self._grid_vec)
+        self._grid_specs = _parse_grid(grid, self._ndim)
+        self._has_grid = bool(self._grid_specs)
         self._gsc: _GridStatsComputerImpl | None = None
         if self._has_grid:
             self._gsc = _GridStatsComputerImpl()
-            self._gsc.set_config(list(self._shape), self._grid_vec, self._n_moments)
+            self._gsc.set_config(
+                list(self._shape), self._grid_specs, list(self._stride),
+                self._n_moments,
+            )
 
     def compute(self, arr: np.ndarray) -> dict[str, np.ndarray]:
         """
@@ -173,15 +192,15 @@ class StatsComputer:
                 self._n_moments,
             )
 
-        # Grid reduction (retains buffers, returns copy — view lifetime is tied to
-        # this StatsComputer object, so always copy for safety)
+        # Grid reductions (K levels). Each level returns a VIEW into a retained
+        # buffer whose lifetime is tied to this StatsComputer, so copy each one.
         if self._has_grid:
             if arr.dtype == np.uint8 and arr.flags["C_CONTIGUOUS"]:
-                result["grid"] = self._gsc.compute_u8(arr).copy()
+                grids = self._gsc.compute_u8(arr)
             else:
-                result["grid"] = self._gsc.compute_f64(
-                    np.ascontiguousarray(arr, np.float64)
-                ).copy()
+                grids = self._gsc.compute_f64(np.ascontiguousarray(arr, np.float64))
+            for i, gv in enumerate(grids):
+                result[f"grid_{i}"] = gv.copy()
 
         return result
 

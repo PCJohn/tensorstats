@@ -31,16 +31,17 @@ import numpy as np
 sc = ts.StatsComputer(
     shape=(64, 64, 3),
     axes=[None, (0, 1)],  # global + per-channel reductions
-    stride=(4, 4, 1),     # subsample H and W by 4, keep all channels
-    grid=(4, 4, 2),       # 16×16 spatial grid, 4 channel cells
+    stride=(4, 4, 1),     # subsample H and W by 4, keep all channels (grid too)
+    grid=[(4, 4, 2), (5, 5, 0)],  # a grid pyramid: two resolutions, one pass
 )
 
 # Call on every frame — reuses internal buffers
 result = sc.compute(hsv_frame)
 
-result["global"]  # (4,)         [mean, variance, m3, m4] over all pixels
-result["0,1"]     # (3, 4)       per-channel moments (one row per channel)
-result["grid"]    # (16,16,4,4)  spatial grid moments
+result["global"]  # (4,)           [mean, variance, m3, m4] over all pixels
+result["0,1"]     # (3, 4)         per-channel moments (one row per channel)
+result["grid_0"]  # (16,16,4,4)    level-0 grid moments
+result["grid_1"]  # (32,32,1,4)    level-1 grid moments
 
 # Derive higher-level quantities from the raw central moments
 var      = result["global"][1]
@@ -61,7 +62,8 @@ sc = ts.StatsComputer(
     shape,         # tuple — every compute() call must use this exact shape
     axes=None,     # None=global, int, tuple, or list e.g. [None, (0,1)]
     stride=None,   # None/1=no stride, int, or per-axis tuple e.g. (4,4,1)
-    grid=None,     # None=no grid, int k (2^k cells/axis), or tuple e.g. (4,4,2)
+    grid=None,     # None=no grid, int k (2^k cells/axis), a per-axis tuple
+                   #   e.g. (4,4,2), or a LIST of tuples for a grid pyramid
     n_moments=4,   # 1–4
 )
 result = sc.compute(arr)  # dict[str, np.ndarray]
@@ -73,7 +75,7 @@ result = sc.compute(arr)  # dict[str, np.ndarray]
 |-----|-------|---------------|
 | `"global"` | `(n_moments,)` | `axes` includes `None` |
 | `"0,1"` | `(C, n_moments)` | `axes` includes `(0,1)` |
-| `"grid"` | `(*cell_shape, n_moments)` | `grid` is set |
+| `"grid_{i}"` | `(*cell_shape, n_moments)` | one per grid level, `i = 0 … K-1` |
 
 Key name for an axis tuple is the comma-joined axis indices, e.g. `"0,1"` for `axes=(0,1)`.
 
@@ -95,9 +97,19 @@ quantities are wanted.
 integer floor-division: `cell[coord, d] = coord * n_cells[d] / shape[d]`.
 For `C=3` and 4 channel cells: H→cell0, S→cell1, V→cell2, cell3 empty.
 
+Pass a **list** of specs for a *grid pyramid* — multiple resolutions computed in a
+single pass over the tensor, e.g. `grid=[(2,2,0),(3,3,0),(4,4,0)]`. Each level is
+returned under its own key `grid_0 … grid_{K-1}` in list order. A single tuple is
+the `K=1` case and yields `grid_0`. Adding levels adds accumulators, not passes:
+the tensor is read once (all-histogram path) or twice (any direct level),
+independent of the number of levels.
+
 **Stride:** subsamples the input. `stride=(4,4,1)` on `(H,W,C)` visits every 4th row
 and column, all channels. The library computes exact moments over the subsampled
-pixels — no interpolation.
+pixels — no interpolation. Stride applies to the grid path too: each cell's
+moments are the exact moments over the visited pixels of that cell, with cell
+boundaries kept at full resolution (so it is *subsample-then-skip*, not
+subsample-then-rebin). For a grid, stride is the main latency lever.
 
 **Supported dtypes:** uint8, float32, float64. Other dtypes are cast to float64.
 
@@ -154,15 +166,23 @@ with 256 FMA operations. Faster than the float two-pass for N ≥ 256 pixels bec
 it avoids N float reads in pass 2 — only 256 histogram bins are touched instead.
 
 **Grid scatter path** (`_GridStatsComputerImpl`, internal):
-Precomputes a `cell_of[]` array (int16, one entry per pixel) mapping each pixel
-flat index to its grid cell. The scatter loops then do one table lookup per pixel
-instead of `ndim` multiplications and additions. Two passes: sum into `mu[]` then
-subtract mean and accumulate moments. The cell-index array and all accumulator
-vectors are retained across `compute()` calls — no heap allocation per frame.
+Each grid level precomputes a `cell_of[]` array (int16, one entry per pixel)
+mapping each pixel flat index to its cell in that level. The scatter loops then do
+one table lookup per pixel instead of `ndim` multiplications and additions. For a
+pyramid the sweep is pixel-outer, level-inner: every pixel is read once and
+scattered into all levels, so the tensor is read once (all-histogram) or twice
+(any direct level) regardless of how many levels are requested. Direct levels do
+two passes (sum into `mu[]`, then subtract mean and accumulate moments); uint8
+levels with large cells use a per-cell 256-bin histogram instead. The cell-index
+arrays and all accumulator vectors are retained across `compute()` calls — no heap
+allocation per frame.
 
 **Stride**: applied in the axes path by stepping the flat index or per-axis
-coordinate. The grid path does not apply stride — if you want a strided grid,
-pass a pre-subsampled array. The library keeps these concerns separate.
+coordinate, and in the grid path by visiting a precomputed list of sampled flat
+indices (built once at config). Grid cell boundaries stay at full resolution and
+non-visited pixels are skipped, so each cell reports the exact moments of its
+visited pixels. Empty cells (when stride, or `n_cells > shape`, leaves a cell
+unvisited) are written as zeros.
 
 **Output**: axes reductions allocate a fresh `double[]` and wrap it in a nanobind
 capsule. Grid reductions write into a retained `out_buf_` and Python immediately

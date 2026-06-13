@@ -167,6 +167,12 @@ array it receives. If a caller wants approximate grid stats from a subsampled
 input, they should pass a pre-subsampled array and document the tradeoff
 explicitly. Keeping this in the library conflated two different responsibilities.
 
+**Update — this decision was reversed.** Stride on the grid is now supported. See
+"Multi-grid pyramid + stride-on-grid" below for the reasoning and the semantics
+that resolved the earlier concern (stride is exact, not approximate: it changes
+*which pixels* are in the population, not *how* the moments over that population
+are computed).
+
 ### `StatsComputer.compute()` returning a view for grid output
 
 **What:** return `result["grid"]` as a zero-copy numpy view into the retained
@@ -177,6 +183,70 @@ C++ buffer, saving one 32KB copy per call.
 before Python reads the view, returning corrupted data. The view lifetime is
 silently tied to the C++ object lifetime, which is not safe to assume.
 Changed to always copy — costs ~0.001ms but is unconditionally safe.
+
+---
+
+## Multi-grid pyramid + stride-on-grid
+
+Two related extensions, designed together so they share one code path.
+
+### Multiple grids in a single pass ("grid pyramid")
+
+**What:** `grid` accepts either a single per-axis spec (e.g. `(4,4,0)`) or a list
+of specs (e.g. `[(2,2,0),(3,3,0),(4,4,0)]`). A list computes K grid resolutions
+at once. Results are keyed `grid_0 … grid_{K-1}` in list order; a single spec is
+just the K=1 case and yields `grid_0`. (The old `"grid"` key was removed — output
+keys are uniform now.)
+
+**Why this design:** the requirement was "no extra passes per resolution." The
+naïve approach (one computer per grid) re-reads the tensor K times. Instead the
+scatter is **pixel-outer, level-inner**: each visited pixel is read once and
+scattered into every level's accumulators. The tensor is read once when every
+level can use the uint8 histogram path, twice when any level needs the direct
+two-pass — independent of K. Adding a resolution adds accumulators, not tensor
+reads. K=1 is the same loop with a length-1 level list, so there is no separate
+single-grid code path to maintain.
+
+Measured (64×64×3 uint8, 3-level pyramid): fused 0.16ms vs three separate
+computers 0.21ms — the gap is the shared passes, and it does not grow toward K×.
+
+State is held per level in a `GridLevel` struct (its own `cell_of`, accumulators,
+optional histogram, output buffer). The class holds the level vector plus a
+hist/direct partition so the uint8 sweep updates histogram levels and direct
+levels in one pass without a per-pixel branch.
+
+**Incidental fix:** the old single-grid pass-1 loaded `cell_of_[i]` twice
+(`mu_[cell_of_[i]] += …; counts_[cell_of_[i]]++`). The rewrite hoists it, which
+roughly halved the single-grid direct-path latency (256-cell: 0.118 → 0.059ms).
+
+### Stride on the grid (reverses the earlier revert)
+
+**What:** the per-axis `stride` now applies to the grid path. With stride, each
+cell's moments are computed over the **subsampled** pixels that fall in it.
+
+**Why the earlier objection no longer applies:** the original revert treated
+stride as "approximate grid stats," which conflated the library's exactness
+guarantee with a sampling decision. The resolution is to define the semantics so
+stride is *exact*, not approximate:
+
+- Stride selects a sub-population of pixels (every Nth along each axis). The
+  reported moments are the **exact** central moments of that sub-population — same
+  guarantee as the full scan, just over fewer points. Nothing is approximated;
+  the accuracy work in this repo (two-pass, no power-sum cancellation) is
+  untouched.
+- **Cell boundaries stay at full resolution** (`coord * n_cells // shape` on the
+  original shape), and non-visited pixels are skipped. This is *not* the same as
+  subsample-then-rebin: when a cell boundary doesn't land on a stride multiple,
+  the two assign boundary pixels to different cells. Full-resolution boundaries
+  are the intuitive choice — "same grid over the image, fewer samples per cell" —
+  so that is the contract, and the test reference (`grid_ref`) mirrors it exactly.
+- Empty cells (possible when stride, or `n_cells > shape`, leaves a cell with no
+  visited pixel) are written as zeros, not left holding stale retained-buffer data.
+
+The strided visit order is precomputed once at config time (`sampled_`, via the
+existing `sampled_indices` helper) and reused every call, consistent with the
+buffer-retention philosophy. Stride is also the latency lever: the 3-level 64²
+pyramid drops from 0.15ms (stride 1) to 0.031ms (stride 4) / 0.021ms (stride 8).
 
 ---
 
