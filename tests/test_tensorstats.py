@@ -395,6 +395,70 @@ class TestStride:
 
 
 # ---------------------------------------------------------------------------
+# Fused last-axis (per-channel) path under stride.
+#
+# Reducing all-but-last with any stride routes through last_axis_fused /
+# last_axis_u8_fused: a single strided walk over the leading axes that collects
+# every channel at once. uint8 stays on the histogram path even with multiple
+# strided leading axes (previously this fell back to a gather). These tests pin
+# correctness against numpy on the same subsampled pixels.
+# ---------------------------------------------------------------------------
+
+
+class TestFusedStridePerChannel:
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.float32, np.float64])
+    def test_multi_axis_stride(self, dtype):
+        rng = np.random.default_rng(101)
+        arr = rng.integers(0, 255, (96, 80, 3)).astype(dtype)
+        out = sc(arr, axes=(0, 1), stride=(2, 2, 1))
+        for c in range(3):
+            ref = numpy_moments(arr[::2, ::2, c])
+            np.testing.assert_allclose(out["0,1"][c], ref, rtol=1e-7, atol=1e-9)
+
+    def test_uint8_matches_float64(self):
+        """Histogram path and direct two-pass must agree exactly on the same
+        integer pixels."""
+        rng = np.random.default_rng(102)
+        base = rng.integers(0, 255, (128, 128, 3))
+        u8 = sc(base.astype(np.uint8), axes=(0, 1), stride=(2, 2, 1))["0,1"]
+        f64 = sc(base.astype(np.float64), axes=(0, 1), stride=(2, 2, 1))["0,1"]
+        np.testing.assert_allclose(u8, f64, rtol=1e-9, atol=1e-9)
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.float64])
+    def test_four_d_three_leading_axes(self, dtype):
+        """Odometer walk over three strided leading axes (4D input)."""
+        rng = np.random.default_rng(103)
+        arr = rng.integers(0, 255, (24, 20, 16, 3)).astype(dtype)
+        out = sc(arr, axes=(0, 1, 2), stride=(2, 2, 2, 1))
+        for c in range(3):
+            ref = numpy_moments(arr[::2, ::2, ::2, c])
+            np.testing.assert_allclose(out["0,1,2"][c], ref, rtol=1e-7, atol=1e-9)
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.float64])
+    def test_single_leading_axis_stride(self, dtype):
+        """axes=(0,) on a 2D array — one strided leading axis."""
+        rng = np.random.default_rng(104)
+        arr = rng.integers(0, 255, (200, 5)).astype(dtype)
+        out = sc(arr, axes=(0,), stride=(3, 1))
+        for c in range(5):
+            ref = numpy_moments(arr[::3, c])
+            np.testing.assert_allclose(out["0"][c], ref, rtol=1e-7, atol=1e-9)
+
+    def test_uint8_faster_than_float64(self):
+        """With the histogram path restored, strided per-channel uint8 must beat
+        the float two-pass."""
+        arr = np.random.default_rng(105).integers(0, 255, (256, 256, 3))
+        cu = ts.StatsComputer(shape=arr.shape, axes=(0, 1), stride=(2, 2, 1))
+        cf = ts.StatsComputer(shape=arr.shape, axes=(0, 1), stride=(2, 2, 1))
+        au, af = arr.astype(np.uint8), arr.astype(np.float64)
+        u8_ms = timeit_ms(lambda: cu.compute(au))
+        f64_ms = timeit_ms(lambda: cf.compute(af))
+        print(f"\n  strided perchan 256x256x3: u8={u8_ms:.4f}ms  f64={f64_ms:.4f}ms")
+        assert u8_ms < f64_ms
+
+
+# ---------------------------------------------------------------------------
 # uint8 histogram path
 # ---------------------------------------------------------------------------
 
@@ -754,7 +818,7 @@ def grid_ref(arr, grid, stride=None):
     ndim = a.ndim
     if stride is None:
         stride = [1] * ndim
-    n_cells = [2 ** g for g in grid]
+    n_cells = [2**g for g in grid]
     cstride = [1] * ndim
     for d in range(ndim - 2, -1, -1):
         cstride[d] = cstride[d + 1] * n_cells[d + 1]
@@ -797,9 +861,13 @@ class TestGridPyramid:
     def test_pyramid_keys_and_order(self):
         arr = np.random.default_rng(301).integers(0, 255, (64, 64, 3), dtype=np.uint8)
         out = sc(arr, axes=None, grid=self.PYRAMID)
-        assert [k for k in out if k.startswith("grid_")] == ["grid_0", "grid_1", "grid_2"]
+        assert [k for k in out if k.startswith("grid_")] == [
+            "grid_0",
+            "grid_1",
+            "grid_2",
+        ]
         for i, g in enumerate(self.PYRAMID):
-            assert out[f"grid_{i}"].shape == tuple(2 ** k for k in g) + (4,)
+            assert out[f"grid_{i}"].shape == tuple(2**k for k in g) + (4,)
 
     def test_pyramid_uint8_matches_per_level(self):
         arr = np.random.default_rng(302).integers(0, 255, (64, 64, 3), dtype=np.uint8)
@@ -882,7 +950,9 @@ class TestGridStride:
         """Distinct per-channel distributions — strided per-channel stats exact
         vs numpy on the same subsampled pixels."""
         rng = np.random.default_rng(403)
-        chans = [rng.normal(m, s, (256, 256)) for m, s in [(50, 5), (128, 20), (200, 3)]]
+        chans = [
+            rng.normal(m, s, (256, 256)) for m, s in [(50, 5), (128, 20), (200, 3)]
+        ]
         arr = np.stack(chans, axis=-1)
         out = sc(arr, axes=(0, 1), stride=(2, 2, 1))
         for c in range(3):
@@ -900,8 +970,9 @@ class TestGridStride:
         for r in range(nc):
             for c in range(nc):
                 k = r * nc + c
-                arr[r * H // nc:(r + 1) * H // nc, c * W // nc:(c + 1) * W // nc] = \
-                    rng.normal(10 * k + 20, 1 + 0.3 * k, (H // nc, W // nc, 1))
+                arr[
+                    r * H // nc : (r + 1) * H // nc, c * W // nc : (c + 1) * W // nc
+                ] = rng.normal(10 * k + 20, 1 + 0.3 * k, (H // nc, W // nc, 1))
         for stride in [(1, 1, 1), (2, 2, 1)]:
             out = sc(arr, axes=None, grid=(2, 2, 0), stride=stride)
             np.testing.assert_allclose(
@@ -917,7 +988,9 @@ class TestGridStride:
         """A grid finer than the strided sampling leaves empty cells -> zeros,
         not stale retained-buffer data."""
         arr = np.random.default_rng(405).integers(0, 255, (16, 16, 3), dtype=np.uint8)
-        out = sc(arr, axes=None, grid=(3, 3, 0), stride=(8, 8, 1))  # 8x8 cells, 2x2 samples
+        out = sc(
+            arr, axes=None, grid=(3, 3, 0), stride=(8, 8, 1)
+        )  # 8x8 cells, 2x2 samples
         ref = grid_ref(arr, (3, 3, 0), stride=[8, 8, 1])
         np.testing.assert_allclose(out["grid_0"], ref, rtol=1e-6, atol=1e-12)
 
@@ -925,7 +998,9 @@ class TestGridStride:
 class TestGridPyramidLatency:
     """Latency sweep across sizes/strides; stride is the lever to the budget."""
 
-    @pytest.mark.parametrize("shape", [(64, 64, 3), (256, 256, 3), (1024, 1024, 3), (2048, 2048, 3)])
+    @pytest.mark.parametrize(
+        "shape", [(64, 64, 3), (256, 256, 3), (1024, 1024, 3), (2048, 2048, 3)]
+    )
     def test_pyramid_latency_sweep(self, shape):
         arr = np.random.default_rng(0).integers(0, 255, shape, dtype=np.uint8)
         pyr = [(2, 2, 0), (3, 3, 0), (4, 4, 0)]
@@ -933,18 +1008,22 @@ class TestGridPyramidLatency:
         def quick_ms(fn):
             for _ in range(3):
                 fn()
-            t0 = time.perf_counter(); fn()
+            t0 = time.perf_counter()
+            fn()
             est = max(time.perf_counter() - t0, 1e-5)
             iters = int(min(300, max(5, 0.05 / est)))  # ~50ms total wall per config
             best = float("inf")
             for _ in range(iters):
-                t0 = time.perf_counter(); fn()
+                t0 = time.perf_counter()
+                fn()
                 best = min(best, (time.perf_counter() - t0) * 1000)
             return best
 
         print(f"\n  {shape} uint8 3-level pyramid:")
         for st in [1, 2, 4, 8]:
-            comp = ts.StatsComputer(shape=shape, axes=None, grid=pyr, stride=(st, st, 1))
+            comp = ts.StatsComputer(
+                shape=shape, axes=None, grid=pyr, stride=(st, st, 1)
+            )
             print(f"    stride={st}: {quick_ms(lambda: comp.compute(arr)):.4f}ms")
 
     def test_fused_not_slower_than_separate(self):
@@ -954,7 +1033,9 @@ class TestGridPyramidLatency:
         seps = [ts.StatsComputer(shape=arr.shape, axes=None, grid=g) for g in pyr]
         f_ms = timeit_ms(lambda: fused.compute(arr))
         s_ms = timeit_ms(lambda: [c.compute(arr) for c in seps])
-        print(f"\n  128x128x3 pyramid fused={f_ms:.4f}ms separate={s_ms:.4f}ms ratio={s_ms/f_ms:.2f}x")
+        print(
+            f"\n  128x128x3 pyramid fused={f_ms:.4f}ms separate={s_ms:.4f}ms ratio={s_ms/f_ms:.2f}x"
+        )
         assert f_ms < s_ms
 
     def test_stride_reduces_latency(self):
