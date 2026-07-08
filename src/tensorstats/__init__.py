@@ -29,9 +29,11 @@ Usage:
 """
 
 from __future__ import annotations
+from typing import Any
+
 import numpy as np
 
-from . import tensorstats_core as _core
+from . import tensorstats_core as _core  # type: ignore[attr-defined]
 
 _compute_f64 = _core.compute_f64
 _compute_f32 = _core.compute_f32
@@ -160,22 +162,18 @@ class StatsComputer:
         self._stride = _parse_stride(stride, self._ndim)
         self._grid_specs = _parse_grid(grid, self._ndim)
         self._has_grid = bool(self._grid_specs)
-        self._gsc: _GridStatsComputerImpl | None = None
+        self._gsc: Any = None  # opaque _GridStatsComputerImpl handle
         if self._has_grid:
             self._gsc = _GridStatsComputerImpl()
             self._gsc.set_config(
-                list(self._shape), self._grid_specs, list(self._stride),
+                list(self._shape),
+                self._grid_specs,
+                list(self._stride),
                 self._n_moments,
             )
 
     def compute(self, arr: np.ndarray) -> dict[str, np.ndarray]:
-        """
-        Compute exact central moments for arr.
-
-        arr must match the shape passed at construction.
-
-
-        """
+        """Compute exact central moments for arr (must match the construction shape)."""
         if arr.shape != self._shape:
             raise ValueError(f"shape mismatch: expected {self._shape}, got {arr.shape}")
 

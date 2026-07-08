@@ -38,8 +38,10 @@ namespace nb = nanobind;
 //               walk over the leading axes collects all channels at once
 //               (last_axis_fused), keeping uint8 on the histogram path.
 //   General   — iterative (flat_idx, bucket) pairs for arbitrary axes
-//   Grid      — pixel-outer scatter into per-cell accumulators;
-//               precomputed int16 cell_of[] eliminates per-pixel arithmetic
+//   Grid      — per-cell moments for one or more resolutions in a single sweep.
+//               Spatial grids reduce contiguous same-cell runs (segmented,
+//               auto-vectorized); other configs scatter pixel-outer into
+//               per-cell accumulators via a precomputed int16 cell_of[].
 //
 // uint8 fast path (Global + LastAxis):
 //   Builds hist[256], computes moments with 256 FMA operations instead of N.
@@ -100,6 +102,24 @@ static void moments_from_hist(const int64_t *TS_RESTRICT hist, int64_t n,
   m4 = a4 * inv;
 }
 
+// Write moment values into a moments-last output slot (out[0..nm-1]).
+static inline void write_moments(double *TS_RESTRICT out, int nm, double mu,
+                                 double m2, double m3, double m4) {
+  if (nm >= 1)
+    out[0] = mu;
+  if (nm >= 2)
+    out[1] = m2;
+  if (nm >= 3)
+    out[2] = m3;
+  if (nm >= 4)
+    out[3] = m4;
+}
+
+static inline void zero_moments(double *TS_RESTRICT out, int nm) {
+  for (int k = 0; k < nm; ++k)
+    out[k] = 0.0;
+}
+
 // Compute global moments from uint8 data with optional uniform stride.
 static void global_u8_hist(const uint8_t *TS_RESTRICT d, int64_t n,
                            int64_t step, double &mu, double &m2, double &m3,
@@ -130,15 +150,18 @@ static void global_u8_hist(const uint8_t *TS_RESTRICT d, int64_t n,
   }
 }
 
-// Compute per-channel moments from uint8 data, reducing over HW rows.
+// Compute per-channel moments from uint8 data, reducing over HW contiguous
+// rows.
 static void last_axis_u8_hist(const uint8_t *TS_RESTRICT d, int64_t HW,
-                              int64_t C, int64_t sr, int64_t sc,
-                              std::vector<double> &mu, std::vector<double> &m2,
-                              std::vector<double> &m3,
+                              int64_t C, std::vector<double> &mu,
+                              std::vector<double> &m2, std::vector<double> &m3,
                               std::vector<double> &m4) {
-  for (int64_t c = 0; c < C; c += sc) {
+  for (int64_t c = 0; c < C; ++c) {
+    // ns is a running counter (== HW), not HW itself: passing the loop-bound
+    // lets -ffast-math turn the mean's divide into a reciprocal-multiply,
+    // perturbing the last bit. Keep the counter for bit-stable output.
     int64_t hist[HIST_BINS] = {}, ns = 0;
-    for (int64_t r = 0; r < HW; r += sr) {
+    for (int64_t r = 0; r < HW; ++r) {
       hist[d[r * C + c]]++;
       ns++;
     }
@@ -251,10 +274,10 @@ static HWY_INLINE hn::VFromD<D> load_chan(D d, const T *TS_RESTRICT p,
   }
 }
 
-// Channels-in-lanes per-channel reduction (contiguous, sr==sc==1). The last
-// (kept) axis maps onto SIMD lanes: one vector op per row reduces a whole
-// channel group. Each lane accumulates its channel over rows in the same order
-// as the scalar path, so output matches last_axis_pass to FMA rounding.
+// Channels-in-lanes per-channel reduction (contiguous). The last (kept) axis
+// maps onto SIMD lanes: one vector op per row reduces a whole channel group.
+// Each lane accumulates its channel over rows in the same order as a scalar
+// per-channel loop would, differing only by FMA rounding.
 template <typename T>
 static void last_axis_simd(const T *TS_RESTRICT data, int64_t HW, int64_t C,
                            std::vector<double> &mu, std::vector<double> &m2,
@@ -291,26 +314,21 @@ static void last_axis_simd(const T *TS_RESTRICT data, int64_t HW, int64_t C,
   }
 }
 
+// Scalar per-channel two-pass over contiguous rows. Only reached for C==1
+// (C>=2 uses last_axis_simd); kept because its mean form (s * 1/HW) is the
+// bit-exact reference the tests pin.
 template <typename T>
 static void last_axis_pass(const T *TS_RESTRICT data, int64_t HW, int64_t C,
-                           int64_t sr, int64_t sc, std::vector<double> &mu,
-                           std::vector<double> &m2, std::vector<double> &m3,
-                           std::vector<double> &m4) {
-  const int64_t nrows = (HW + sr - 1) / sr;
-  const double inv = 1.0 / (double)nrows;
-  for (int64_t c = 0; c < C; c += sc) {
+                           std::vector<double> &mu, std::vector<double> &m2,
+                           std::vector<double> &m3, std::vector<double> &m4) {
+  const double inv = 1.0 / (double)HW;
+  for (int64_t c = 0; c < C; ++c) {
     double s = 0;
-#if defined(_MSC_VER)
-#pragma loop(ivdep)
-#endif
-    for (int64_t r = 0; r < HW; r += sr)
+    for (int64_t r = 0; r < HW; ++r)
       s += (double)data[r * C + c];
     mu[c] = s * inv;
     double s2 = 0, s3 = 0, s4 = 0;
-#if defined(_MSC_VER)
-#pragma loop(ivdep)
-#endif
-    for (int64_t r = 0; r < HW; r += sr) {
+    for (int64_t r = 0; r < HW; ++r) {
       const double d = (double)data[r * C + c] - mu[c], d2 = d * d;
       s2 += d2;
       s3 += d2 * d;
@@ -559,16 +577,8 @@ pack(const std::vector<double> &mu, const std::vector<double> &m2,
   std::vector<size_t> sh(out_shape.begin(), out_shape.end());
   sh.push_back((size_t)n_moments);
   auto *ptr = new double[(size_t)nacc * (size_t)n_moments];
-  for (int64_t i = 0; i < nacc; ++i) {
-    if (n_moments >= 1)
-      ptr[i * n_moments + 0] = mu[i];
-    if (n_moments >= 2)
-      ptr[i * n_moments + 1] = m2[i];
-    if (n_moments >= 3)
-      ptr[i * n_moments + 2] = m3[i];
-    if (n_moments >= 4)
-      ptr[i * n_moments + 3] = m4[i];
-  }
+  for (int64_t i = 0; i < nacc; ++i)
+    write_moments(ptr + i * n_moments, n_moments, mu[i], m2[i], m3[i], m4[i]);
   nb::capsule own(ptr,
                   [](void *p) noexcept { delete[] static_cast<double *>(p); });
   return nb::ndarray<nb::numpy, double>(ptr, sh.size(), sh.data(), own);
@@ -615,14 +625,7 @@ static nb::dict compute_typed(const T *data, const std::vector<int64_t> &shape,
                              m4);
       }
       auto *p = new double[n_moments];
-      if (n_moments >= 1)
-        p[0] = mu;
-      if (n_moments >= 2)
-        p[1] = m2;
-      if (n_moments >= 3)
-        p[2] = m3;
-      if (n_moments >= 4)
-        p[3] = m4;
+      write_moments(p, n_moments, mu, m2, m3, m4);
       const size_t sh = (size_t)n_moments;
       nb::capsule own(
           p, [](void *x) noexcept { delete[] static_cast<double *>(x); });
@@ -646,7 +649,7 @@ static nb::dict compute_typed(const T *data, const std::vector<int64_t> &shape,
 
         if constexpr (std::is_same_v<T, uint8_t>) {
           if (!has_stride)
-            last_axis_u8_hist(data, HW, C, 1, 1, mu, m2, m3, m4);
+            last_axis_u8_hist(data, HW, C, mu, m2, m3, m4);
           else if (channel_contig)
             last_axis_u8_fused(data, shape, stride, C, mu, m2, m3, m4);
           else
@@ -659,7 +662,7 @@ static nb::dict compute_typed(const T *data, const std::vector<int64_t> &shape,
             if (C >= 2)
               last_axis_simd<T>(data, HW, C, mu, m2, m3, m4);
             else
-              last_axis_pass<T>(data, HW, C, 1, 1, mu, m2, m3, m4);
+              last_axis_pass<T>(data, HW, C, mu, m2, m3, m4);
           } else if (channel_contig)
             last_axis_fused<T>(data, shape, stride, C, mu, m2, m3, m4);
           else
@@ -709,11 +712,12 @@ static nb::dict compute_typed(const T *data, const std::vector<int64_t> &shape,
 // order is precomputed once at config time (sampled_).
 //
 // Retained across calls (fixed shape + grid config), per level:
-//   cell_of   int16 flat cell index per pixel — precomputed, no per-pixel
-//   arith. mu/m2/m3/m4/counts  accumulators (total_cells each). hists per-cell
-//   hist[256] (uint8 histogram path only). out_buf   output buffer (total_cells
-//   * n_moments). compute_* returns VIEWS;
-//             Python copies before the next call.
+//   cell_of         int16 flat cell index per pixel (precomputed)
+//   mu/m2/m3/m4     per-cell accumulators, counts per-cell pixel count
+//   hists           per-cell 256-bin histograms (uint8 histogram path only)
+//   seg_cell/off    run-length encoding of cell_of (segmented path)
+//   out_buf         output buffer (total_cells * n_moments)
+// compute_* returns VIEWS into out_buf; Python copies before the next call.
 //
 // Grid cell assignment (per level, per axis): floor-division gives uniform
 // boundaries for any shape — cell[coord,d] = coord * n_cells[d] / shape[d].
@@ -744,19 +748,11 @@ struct GridLevel {
 static inline void pack_cell(GridLevel &L, int64_t c, int nm) {
   double *out = L.out_buf.data() + c * nm;
   if (!L.counts[c]) {
-    for (int k = 0; k < nm; ++k)
-      out[k] = 0.0;
+    zero_moments(out, nm);
     return;
   }
   const double inv = 1.0 / (double)L.counts[c];
-  if (nm >= 1)
-    out[0] = L.mu[c];
-  if (nm >= 2)
-    out[1] = L.m2[c] * inv;
-  if (nm >= 3)
-    out[2] = L.m3[c] * inv;
-  if (nm >= 4)
-    out[3] = L.m4[c] * inv;
+  write_moments(out, nm, L.mu[c], L.m2[c] * inv, L.m3[c] * inv, L.m4[c] * inv);
 }
 
 class _GridStatsComputerImpl {
@@ -888,21 +884,13 @@ class _GridStatsComputerImpl {
       for (int64_t c = 0; c < L.total_cells; ++c) {
         double *out = L.out_buf.data() + c * nm;
         if (!L.counts[c]) {
-          for (int q = 0; q < nm; ++q)
-            out[q] = 0.0;
+          zero_moments(out, nm);
           continue;
         }
         double mu, m2, m3, m4;
         moments_from_hist(L.hists.data() + c * HIST_BINS, L.counts[c], mu, m2,
                           m3, m4);
-        if (nm >= 1)
-          out[0] = mu;
-        if (nm >= 2)
-          out[1] = m2;
-        if (nm >= 3)
-          out[2] = m3;
-        if (nm >= 4)
-          out[3] = m4;
+        write_moments(out, nm, mu, m2, m3, m4);
       }
     }
     if (direct_idx_.empty())
@@ -1023,12 +1011,9 @@ class _GridStatsComputerImpl {
 
   // True when every level qualifies for the segmented path (long runs).
   bool all_seg() const {
-    if (levels_.empty())
-      return false;
-    for (const GridLevel &L : levels_)
-      if (!L.use_seg)
-        return false;
-    return true;
+    return !levels_.empty() &&
+           std::all_of(levels_.begin(), levels_.end(),
+                       [](const GridLevel &L) { return L.use_seg; });
   }
 
 public:
