@@ -40,6 +40,76 @@ counts — tensorstats wins because it avoids per-cell Python overhead entirely.
 
 ---
 
+## Build/codegen wins (SIMD enablement)
+
+### NOMINSIZE — the module was silently built `-Os`
+
+`nanobind_add_module` adds `-Os` (optimise-for-size) as a PRIVATE option; under
+pip's flag ordering it lands *after* our `-O3`, so `-Os` won and
+auto-vectorisation was disabled module-wide. The imported `.so` had **zero
+packed-double ops** — every float reduction (`global_pass`, `last_axis_pass`,
+grid two-pass) ran scalar. Passing `NOMINSIZE` restores `-O3` and lets the
+compiler auto-vectorise the contiguous reductions on its own.
+
+Diagnosis: census the *imported* `.so`, not the `src/` copy:
+`objdump -d "$(python -c 'import tensorstats.tensorstats_core as m;print(m.__file__)')" | grep -c vaddpd`.
+
+Same-sandbox before/after (288×512×3): f64 global 1.84→0.32ms (5.8×), f64
+per-channel 1.17→0.70ms, f64 grid 4.25→2.75ms. uint8 histogram path is
+unaffected (integer build; its finalize is addressed below).
+
+### Branchless `moments_from_hist`
+
+The 256-bin finalize had `if (!hist[v]) continue;`, whose data-dependent branch
+blocked vectorisation. Removing it (empty bins contribute `0.0`) lets the loop
+vectorise 8-wide. Helps every histogram consumer: uint8 per-channel and, notably,
+the uint8 grid finalize (one call per cell). Same-sandbox: uint8 per-channel
+0.30→0.24ms, uint8 grid 1.84→1.50ms.
+
+Not bit-identical to the branch version: `-ffast-math` reassociates the now-packed
+accumulators (tree vs sequential), so results differ by reduction order. Measured
+max relative error over 50k random histograms is 3.8e-10, dominated by near-zero
+m3; well within the suite's rtol. Histogram *counts* stay integer-exact — only the
+float finalize order changes. (This is the general SIMD contract here: literal
+bit-identity is incompatible with `-ffast-math` reassociation, which NOMINSIZE's
+auto-vec already introduced.)
+
+### Segmented (run-length) grid direct path
+
+The grid scatter (`mu[cell_of[i]] += data[i]`) is the dominant cost library-wide
+and doesn't auto-vectorize (data-dependent target, intra-vector conflicts). But
+grid cells are contiguous axis-aligned blocks, so `cell_of` is *piecewise-constant
+in flat order* — one cell holds over a maximal contiguous run. Run-length encode
+`cell_of` once at config (`seg_cell`, `seg_off`); the hot loop then reduces each
+run with contiguous, auto-vectorized loads and scatters once per run. Same kernel
+(`_run_seg<T>`) serves uint8 and float — for uint8 it replaces the histogram path
+with a direct two-pass reduction, which vectorizes and beats the non-vectorizable
+`hists[c*256+v]++` build.
+
+Dispatch: non-strided only, and only when every level's average run length ≥
+`SEG_MIN_RUN` (16). Spatial grids (channel exponent 0) have long runs; a
+channel-gridded grid like `(4,4,2)` has runs of length 1 and stays on the scalar
+fused scatter (no regression). Small frames (64×64×3, ~12-elem runs) also fall
+below the threshold and stay scalar. Strided keeps the scalar `sampled_` path.
+
+Same-module measured (288×512×3, this sandbox), scalar vs segmented:
+
+| case | scalar | segmented | speedup |
+|------|--------|-----------|---------|
+| uint8 grid(4,4,0) | 1.26ms | 0.42ms | 3.0× |
+| float64 grid(4,4,0) | 2.48ms | 0.64ms | 3.9× |
+| float64 grid(4,4,2) | 1.68ms | 1.68ms | — (scalar fallback) |
+
+Quality: segmented agrees with the scalar path and numpy to ~1e-11–1e-13 relative
+(per-run partial sums are pairwise-like, if anything slightly *more* accurate than
+the sequential scatter). Well within the suite's rtol.
+
+Not covered (future): channel-gridded configs `(k,k,>0)` have short runs; the win
+there is channels-in-lanes (C channels → SIMD lanes), standalone ceiling ~2.9×.
+Also, for very large cells the uint8 histogram is single-read vs segmented's
+two-read — a regime where histogram may still win; not observed at typical frame
+sizes.
+
 ## What was built: algorithmic approaches
 
 ### 1. uint8 histogram path (global + per-channel)

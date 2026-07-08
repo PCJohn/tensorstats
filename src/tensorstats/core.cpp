@@ -1,3 +1,5 @@
+#include "hwy/highway.h"
+
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/vector.h>
@@ -50,6 +52,11 @@ static constexpr int HIST_BINS = 256;
 // Minimum pixels-per-cell to prefer the histogram path in the grid.
 static constexpr int64_t HIST_THRESHOLD = 256;
 
+// Minimum average run length (contiguous same-cell pixels in flat order) to use
+// the segmented direct path in the grid. Below this, per-run overhead dominates
+// and the fused scatter is faster.
+static constexpr int64_t SEG_MIN_RUN = 16;
+
 // Maximum number of grid cells (must fit in int16_t).
 static constexpr int64_t MAX_GRID_CELLS = 32767;
 
@@ -80,19 +87,17 @@ static void moments_from_hist(const int64_t *TS_RESTRICT hist, int64_t n,
   for (int v = 0; v < HIST_BINS; ++v)
     s1 += hist[v] * (int64_t)v;
   mu = (double)s1 / (double)n;
-  m2 = m3 = m4 = 0.0;
+  double a2 = 0.0, a3 = 0.0, a4 = 0.0;
   for (int v = 0; v < HIST_BINS; ++v) {
-    if (!hist[v])
-      continue;
-    double x = (double)v - mu, x2 = x * x, h = (double)hist[v];
-    m2 += h * x2;
-    m3 += h * x2 * x;
-    m4 += h * x2 * x2;
+    const double x = (double)v - mu, x2 = x * x, h = (double)hist[v];
+    a2 += h * x2;
+    a3 += h * x2 * x;
+    a4 += h * x2 * x2;
   }
   const double inv = 1.0 / (double)n;
-  m2 *= inv;
-  m3 *= inv;
-  m4 *= inv;
+  m2 = a2 * inv;
+  m3 = a3 * inv;
+  m4 = a4 * inv;
 }
 
 // Compute global moments from uint8 data with optional uniform stride.
@@ -228,6 +233,62 @@ static void global_pass_idx(const T *TS_RESTRICT data,
   m2 *= inv;
   m3 *= inv;
   m4 *= inv;
+}
+
+namespace hn = hwy::HWY_NAMESPACE;
+
+// Load n (<= Lanes) channels at p into a double vector lane-per-channel,
+// promoting from T; unused tail lanes are zero. Contiguous channels only.
+template <typename D, typename T>
+static HWY_INLINE hn::VFromD<D> load_chan(D d, const T *TS_RESTRICT p,
+                                          size_t n) {
+  if constexpr (std::is_same_v<T, double>) {
+    return n == hn::Lanes(d) ? hn::LoadU(d, p) : hn::LoadN(d, p, n);
+  } else {
+    const hn::Rebind<T, D> ds;
+    const auto v = n == hn::Lanes(d) ? hn::LoadU(ds, p) : hn::LoadN(ds, p, n);
+    return hn::PromoteTo(d, v);
+  }
+}
+
+// Channels-in-lanes per-channel reduction (contiguous, sr==sc==1). The last
+// (kept) axis maps onto SIMD lanes: one vector op per row reduces a whole
+// channel group. Each lane accumulates its channel over rows in the same order
+// as the scalar path, so output matches last_axis_pass to FMA rounding.
+template <typename T>
+static void last_axis_simd(const T *TS_RESTRICT data, int64_t HW, int64_t C,
+                           std::vector<double> &mu, std::vector<double> &m2,
+                           std::vector<double> &m3, std::vector<double> &m4) {
+  const hn::ScalableTag<double> d;
+  const int64_t L = (int64_t)hn::Lanes(d);
+  const double inv = 1.0 / (double)HW;
+  const auto vinv = hn::Set(d, inv);
+  double tmp[hn::MaxLanes(d)];
+  for (int64_t ch0 = 0; ch0 < C; ch0 += L) {
+    const size_t n = (size_t)std::min<int64_t>(L, C - ch0);
+    auto sv = hn::Zero(d);
+    for (int64_t r = 0; r < HW; ++r)
+      sv = hn::Add(sv, load_chan(d, data + r * C + ch0, n));
+    const auto muv = hn::Mul(sv, vinv);
+    auto a2 = hn::Zero(d), a3 = hn::Zero(d), a4 = hn::Zero(d);
+    for (int64_t r = 0; r < HW; ++r) {
+      const auto x = hn::Sub(load_chan(d, data + r * C + ch0, n), muv);
+      const auto x2 = hn::Mul(x, x);
+      a2 = hn::Add(a2, x2);
+      a3 = hn::Add(a3, hn::Mul(x2, x));
+      a4 = hn::Add(a4, hn::Mul(x2, x2));
+    }
+    auto flush = [&](const hn::VFromD<decltype(d)> &v, std::vector<double> &out,
+                     bool scale) {
+      hn::Store(scale ? hn::Mul(v, vinv) : v, d, tmp);
+      for (size_t k = 0; k < n; ++k)
+        out[ch0 + k] = tmp[k];
+    };
+    flush(muv, mu, false);
+    flush(a2, m2, true);
+    flush(a3, m3, true);
+    flush(a4, m4, true);
+  }
 }
 
 template <typename T>
@@ -594,9 +655,12 @@ static nb::dict compute_typed(const T *data, const std::vector<int64_t> &shape,
                 make_pairs(shape, stride, spec.reduce_axes, spec.out_strides),
                 nacc, mu, m2, m3, m4);
         } else {
-          if (!has_stride)
-            last_axis_pass<T>(data, HW, C, 1, 1, mu, m2, m3, m4);
-          else if (channel_contig)
+          if (!has_stride) {
+            if (C >= 2)
+              last_axis_simd<T>(data, HW, C, mu, m2, m3, m4);
+            else
+              last_axis_pass<T>(data, HW, C, 1, 1, mu, m2, m3, m4);
+          } else if (channel_contig)
             last_axis_fused<T>(data, shape, stride, C, mu, m2, m3, m4);
           else
             general_pass<T>(
@@ -664,6 +728,14 @@ struct GridLevel {
   std::vector<double> mu, m2, m3, m4, out_buf;
   std::vector<int64_t> counts;
   std::vector<int64_t> hists; // total_cells * HIST_BINS (use_hist only)
+  // Segmented direct path (spatial grids, long runs): run-length encoding of
+  // cell_of in flat order. A run is a maximal contiguous span of one cell, so a
+  // whole run reduces with contiguous (auto-vectorized) loads. Non-strided
+  // only.
+  bool use_seg = false;
+  std::vector<int16_t> seg_cell;
+  std::vector<int64_t>
+      seg_off; // size n_seg+1; run s spans [seg_off[s], seg_off[s+1])
 };
 
 // Finalise one cell's central moments into out_buf. Empty cells (possible once
@@ -757,6 +829,23 @@ class _GridStatsComputerImpl {
     if (L.use_hist)
       L.hists.assign(L.total_cells * HIST_BINS, 0);
     L.out_buf.assign(L.total_cells * n_moments_, 0.0);
+
+    // Run-length encode cell_of for the segmented path (non-strided only). Long
+    // runs (spatial grids) reduce per-run with vectorized contiguous loads;
+    // when runs are short (e.g. channel-gridded), fall back to the fused
+    // scatter.
+    if (!strided_) {
+      L.seg_off.push_back(0);
+      for (int64_t k = 0; k < total_;) {
+        const int16_t c = L.cell_of[k];
+        while (k < total_ && L.cell_of[k] == c)
+          ++k;
+        L.seg_cell.push_back(c);
+        L.seg_off.push_back(k);
+      }
+      const double avg_run = (double)total_ / (double)L.seg_cell.size();
+      L.use_seg = avg_run >= (double)SEG_MIN_RUN;
+    }
 
     L.out_shape.assign(n_cells.begin(), n_cells.end());
     L.out_shape.push_back((size_t)n_moments_);
@@ -886,6 +975,62 @@ class _GridStatsComputerImpl {
         pack_cell(L, c, nm);
   }
 
+  // Segmented direct two-pass, shared by uint8 and float. Each cell run is a
+  // contiguous span, so both passes reduce with vectorized contiguous loads
+  // instead of a dependency-carrying scatter into mu[c]. Used (non-strided)
+  // when every level's runs are long enough (spatial grids); replaces both the
+  // float scatter and the uint8 histogram for that case. Bit-agrees with the
+  // scalar path to ~1e-10 (reduction-order only).
+  template <typename T> void _run_seg(const T *TS_RESTRICT data) {
+    const int nm = n_moments_;
+    for (GridLevel &L : levels_) {
+      const int64_t nc = L.total_cells, ns = (int64_t)L.seg_cell.size();
+      std::fill(L.mu.begin(), L.mu.end(), 0.0);
+      std::fill(L.counts.begin(), L.counts.end(), 0);
+      for (int64_t s = 0; s < ns; ++s) {
+        const int16_t c = L.seg_cell[s];
+        const int64_t a = L.seg_off[s], b = L.seg_off[s + 1];
+        double acc = 0.0;
+        for (int64_t i = a; i < b; ++i)
+          acc += (double)data[i];
+        L.mu[c] += acc;
+        L.counts[c] += b - a;
+      }
+      for (int64_t c = 0; c < nc; ++c)
+        L.mu[c] = L.counts[c] > 0 ? L.mu[c] / (double)L.counts[c] : 0.0;
+      std::fill(L.m2.begin(), L.m2.end(), 0.0);
+      std::fill(L.m3.begin(), L.m3.end(), 0.0);
+      std::fill(L.m4.begin(), L.m4.end(), 0.0);
+      for (int64_t s = 0; s < ns; ++s) {
+        const int16_t c = L.seg_cell[s];
+        const int64_t a = L.seg_off[s], b = L.seg_off[s + 1];
+        const double mc = L.mu[c];
+        double a2 = 0.0, a3 = 0.0, a4 = 0.0;
+        for (int64_t i = a; i < b; ++i) {
+          const double x = (double)data[i] - mc, x2 = x * x;
+          a2 += x2;
+          a3 += x2 * x;
+          a4 += x2 * x2;
+        }
+        L.m2[c] += a2;
+        L.m3[c] += a3;
+        L.m4[c] += a4;
+      }
+      for (int64_t c = 0; c < nc; ++c)
+        pack_cell(L, c, nm);
+    }
+  }
+
+  // True when every level qualifies for the segmented path (long runs).
+  bool all_seg() const {
+    if (levels_.empty())
+      return false;
+    for (const GridLevel &L : levels_)
+      if (!L.use_seg)
+        return false;
+    return true;
+  }
+
 public:
   _GridStatsComputerImpl() = default;
 
@@ -919,6 +1064,10 @@ public:
   // Returns a list of VIEWS (one per level) into retained out_bufs — the caller
   // copies each before the next compute().
   nb::list compute_u8(const uint8_t *TS_RESTRICT data) {
+    if (!strided_ && all_seg()) {
+      _run_seg<uint8_t>(data);
+      return _views();
+    }
     const int64_t nv = strided_ ? (int64_t)sampled_.size() : total_;
     if (strided_)
       _run_u8<true>(data, nv);
@@ -928,6 +1077,10 @@ public:
   }
 
   nb::list compute_f64(const double *TS_RESTRICT data) {
+    if (!strided_ && all_seg()) {
+      _run_seg<double>(data);
+      return _views();
+    }
     const int64_t nv = strided_ ? (int64_t)sampled_.size() : total_;
     if (strided_)
       _run_f64<true>(data, nv);

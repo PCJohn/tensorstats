@@ -134,6 +134,10 @@ higher-dimensional tensors (2D through 6D), and latency benchmarks.
 
 ## Performance
 
+> Note: the numbers below predate the `NOMINSIZE` build fix and branchless
+> histogram finalize (see NOTES.md), which cut float paths up to ~5.8× and uint8
+> grid/per-channel ~1.2–1.3×. Re-measure on real hardware before quoting.
+
 **Linux** (GCC -O3 -march=native, `axes=[None,(0,1)], grid=(4,4,2)`):
 
 | Shape | dtype | stride | `sc.compute()` p50 |

@@ -20,10 +20,26 @@ endif()
 find_package(Python 3.9 COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(nanobind CONFIG REQUIRED)
 
+# Google Highway: portable SIMD for the channels-in-lanes kernels. Header-only
+# use (static dispatch, target chosen by -march); we only need its include path.
+include(FetchContent)
+FetchContent_Declare(
+  highway
+  GIT_REPOSITORY https://github.com/google/highway.git
+  GIT_TAG 1.2.0
+  GIT_SHALLOW TRUE)
+set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_CONTRIB OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(highway)
+
 nanobind_add_module(
     tensorstats_core
     STABLE_ABI
+    NOMINSIZE
     src/tensorstats/core.cpp
 )
+target_link_libraries(tensorstats_core PRIVATE hwy)
 
 install(TARGETS tensorstats_core LIBRARY DESTINATION tensorstats)
